@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Mapping
 
 MAX_UTTERANCE_LIMIT_S = 300.0
+MIN_TURN_WINDOW_S = 0.25
+MAX_TURN_WINDOW_S = 10.0
 
 _CHOICES = {
     "embedder": ("auto", "ecapa", "mfcc"),
@@ -19,6 +21,21 @@ _CHOICES = {
 def _get(env: Mapping[str, str], key: str, default: str) -> str:
     value = env.get(key, "").strip()
     return value if value else default
+
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+
+def _flag(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = _get(env, key, "").lower()
+    if not raw:
+        return default
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise ValueError(f"{key} must be 1 or 0 (or true/false), got {raw!r}")
 
 
 def _num(env: Mapping[str, str], key: str, default: float, cast: type) -> float:
@@ -46,6 +63,14 @@ class Settings:
     device: str = "cpu"
     host: str = "127.0.0.1"
     port: int = 8000
+    # Speaker-turn splitting inside a segment (speakers/turns.py).
+    turn_min_segment_s: float = 2.0
+    turn_window_s: float = 1.5
+    turn_hop_s: float = 0.5
+    turn_min_s: float = 1.0
+    # Robustness to voice variation (speakers/embedder.py, speakers/registry.py).
+    enroll_augment: bool = True
+    adapt: bool = True
 
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir)
@@ -76,6 +101,20 @@ class Settings:
             f"> CT_MIN_UTTERANCE_S ({lo}) and <= {MAX_UTTERANCE_LIMIT_S:.0f}",
         )
         check("CT_PORT", self.port, 0 <= self.port <= 65535, "a port number (0-65535)")
+        seg = self.turn_min_segment_s
+        check("CT_TURN_MIN_SEGMENT_S", seg, seg >= 0, ">= 0")
+        win, hop = self.turn_window_s, self.turn_hop_s
+        check(
+            "CT_TURN_WINDOW_S",
+            win,
+            MIN_TURN_WINDOW_S <= win <= MAX_TURN_WINDOW_S,
+            f"in [{MIN_TURN_WINDOW_S}, {MAX_TURN_WINDOW_S:.0f}]",
+        )
+        check("CT_TURN_HOP_S", hop, 0 < hop <= win, f"> 0 and <= CT_TURN_WINDOW_S ({win})")
+        check("CT_TURN_MIN_S", self.turn_min_s, self.turn_min_s >= 0, ">= 0")
+        for env, flag in (("CT_ENROLL_AUGMENT", self.enroll_augment), ("CT_ADAPT", self.adapt)):
+            if not isinstance(flag, bool):
+                raise ValueError(f"{env} must be a boolean, got {flag!r}")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -94,4 +133,10 @@ class Settings:
             device=_get(env, "CT_DEVICE", "cpu"),
             host=_get(env, "CT_HOST", "127.0.0.1"),
             port=int(_num(env, "CT_PORT", 8000, int)),
+            turn_min_segment_s=_num(env, "CT_TURN_MIN_SEGMENT_S", 2.0, float),
+            turn_window_s=_num(env, "CT_TURN_WINDOW_S", 1.5, float),
+            turn_hop_s=_num(env, "CT_TURN_HOP_S", 0.5, float),
+            turn_min_s=_num(env, "CT_TURN_MIN_S", 1.0, float),
+            enroll_augment=_flag(env, "CT_ENROLL_AUGMENT", True),
+            adapt=_flag(env, "CT_ADAPT", True),
         )

@@ -11,7 +11,7 @@ Convo Tracker turns a live conversation into a transcript where every line is la
 1. **Enroll.** For each person: type a name, press Record, speak for about 8 seconds, press Stop. The server turns the clip into a voiceprint (a speaker embedding) and stores it.
 2. **Listen.** Press Start. The browser streams microphone audio to the Python server over a WebSocket.
 3. **Segment.** The server splits the stream into utterances wherever there is a pause.
-4. **Identify and transcribe.** Each utterance gets a voiceprint, compared against every enrolled person, and a speech-to-text transcript.
+4. **Identify and transcribe.** Each utterance is checked for a change of speaker, gets a voiceprint compared against every enrolled person, and a speech-to-text transcript; a change of speaker without a pause becomes separate lines.
 5. **Display.** The browser appends `Name: text` to the conversation feed, in order.
 
 **Goals for v1**
@@ -21,7 +21,7 @@ Convo Tracker turns a live conversation into a transcript where every line is la
 - Lines that match no one well enough are labeled **Unknown** instead of being forced onto someone.
 - Everything runs locally; no cloud API keys.
 
-**Not in v1**: accounts, a database, multiple rooms, splitting two people who talk over each other, and automatic discovery of new speakers (that is approach two, in the roadmap).
+**Not in v1**: accounts, a database, multiple rooms, separating two people who talk at the same time, and automatic discovery of new speakers (that is approach two, in the roadmap).
 
 ## Architecture
 
@@ -107,9 +107,10 @@ The backend is a small FastAPI package, `backend/app`, with one module per job. 
 | `audio/io.py` | `decode_wav()`, `pcm16_to_float()` | Any WAV to 16 kHz mono float32; raw PCM bytes to float32 |
 | `audio/vad.py` | `Segmenter` | Streaming energy VAD: 30 ms frames, adaptive noise floor, 300 ms pre-roll, 700 ms end-of-speech pause, 15 s max |
 | `speakers/embedder.py` | `EcapaEmbedder`, `MfccEmbedder` | Audio to an L2-normalised voiceprint vector |
-| `speakers/registry.py` | `SpeakerRegistry` | Stores voiceprints, computes centroids, identifies speakers by cosine similarity, persists to JSON, thread-safe |
+| `speakers/registry.py` | `SpeakerRegistry` | Stores voiceprints (samples, augmented, adaptive), identifies speakers by centroid/prototype similarity, persists to JSON, thread-safe |
+| `speakers/turns.py` | `detect_turns()` | Finds speaker changes inside one segment with sliding-window voiceprints |
 | `transcription/transcriber.py` | `WhisperTranscriber`, `NullTranscriber` | Audio to text |
-| `pipeline.py` | `SessionPipeline` | Glues it together: segment, embed, identify, transcribe, emit `Utterance` |
+| `pipeline.py` | `SessionPipeline` | Glues it together: segment, split into speaker turns, embed, identify, transcribe, emit one `Utterance` per turn |
 
 **Concurrency.** The WebSocket receive loop only buffers audio and runs the cheap VAD. Embedding and transcription run in a worker thread (`asyncio.to_thread`) fed by an `asyncio.Queue`, one worker per connection, so lines come out in order and incoming audio is never dropped while Whisper is busy.
 
@@ -126,6 +127,9 @@ The backend is a small FastAPI package, `backend/app`, with one module per job. 
 | `CT_MAX_UTTERANCE_S` | `15` | Force-cut long monologues |
 | `CT_MIN_UTTERANCE_S` | `0.5` | Drop clicks and coughs |
 | `CT_DATA_DIR` | `./data` | Where `speakers.json` lives |
+| `CT_TURN_MIN_SEGMENT_S` / `CT_TURN_WINDOW_S` / `CT_TURN_HOP_S` / `CT_TURN_MIN_S` | `2.0` / `1.5` / `0.5` / `1.0` | Speaker-change detection inside an utterance |
+| `CT_ENROLL_AUGMENT` | `1` | Store pitch/speed-perturbed enrollment voiceprints |
+| `CT_ADAPT` | `1` | Learn in-memory prototypes from confident live speech |
 | `CT_HOST` / `CT_PORT` | `127.0.0.1` / `8000` | Server bind address |
 
 ## API contract
@@ -161,7 +165,11 @@ Utterances arrive in `seq` order; `start` and `end` are seconds since the sessio
 
 ## Speaker recognition
 
-Each utterance is assigned to the enrolled person whose voiceprint is most similar, as long as the similarity clears a threshold (0.30 for ECAPA); otherwise it is labeled Unknown.
+Each utterance is assigned to the enrolled person whose voiceprints are most similar, as long as the similarity clears a threshold (0.30 for ECAPA); otherwise it is labeled Unknown. When the speaker changes inside one stretch of speech with no pause, the stretch is split into one line per speaker.
+
+**Loudness normalisation**
+
+Before any clip is embedded (enrollment and live), its voiced frames are scaled to about -23 dBFS, with a peak limit so nothing clips. Near-silent clips are left alone. Speaking louder or sitting further from the mic therefore no longer moves the voiceprint.
 
 **Enrollment**
 
@@ -169,21 +177,37 @@ Each utterance is assigned to the enrolled person whose voiceprint is most simil
 2. Reject the sample if less than 2 s of speech remains.
 3. Slide a 3 s window with a 1.5 s hop over the speech, embed each window, average, and re-normalise. Averaging windows smooths over one odd syllable.
 4. Store it as one sample. A person's **centroid** is the normalised mean of all their samples, so "+ sample" improves accuracy.
+5. **Augmentation** (`CT_ENROLL_AUGMENT`, on by default): the sample is also embedded after speed perturbation at 0.9x and 1.1x (pitch about -1.8 / +1.65 semitones, the standard speaker-recognition "speed perturb") and, when torchaudio is installed, after pure pitch shifts of ±2 semitones. These **augmented** voiceprints are stored with the sample in `speakers.json`; they do not count as extra samples. They teach the registry what the person sounds like a little higher or lower than in the recording.
+
+The People panel suggests recording 2–3 samples per person: normal voice, louder or more animated, quieter.
 
 **Identification**
 
-The score is cosine similarity between the utterance voiceprint `u` and each centroid `c`:
+Each person has a set of **prototypes**: their real sample voiceprints, the augmented ones, and any adaptive ones (below). The score of an utterance voiceprint `u` against a person is
 
 ```
-score(u, c) = (u · c) / (‖u‖ ‖c‖)
+score = max( cos(u, centroid), mean of the 2 highest cos(u, p) over the person's prototypes p )
 ```
+
+so an utterance that matches one variant of the voice well (for example the higher-pitched copy) scores high even if it is far from the average.
 
 1. Compute the score against every enrolled person.
 2. Best score at or above `CT_MATCH_THRESHOLD`: label with that person.
 3. Below it: label **Unknown** (gray), keeping the line in the transcript.
 4. **Continuity smoothing** for very short utterances (under 1 s): if the top two scores are within 0.05 and one of them is the previous speaker, keep the previous speaker. Short clips like "yeah" give noisy voiceprints, and conversations usually stay with one speaker.
 
-**Tuning.** Raise the threshold if people get mixed up; lower it if too many lines are Unknown. The MFCC fallback is much weaker and uses 0.80; it is meant for tests, not real rooms.
+**Adaptive prototypes** (`CT_ADAPT`, on by default). When a live line with at least 2 s of speech is identified very confidently (score at least threshold + 0.15 and at least 0.10 above the runner-up), its voiceprint is added as an extra prototype for that person. They are kept in memory only (never saved), at most 20 per person (oldest dropped first), and are discarded when the person is deleted. Recognition therefore follows how someone sounds today, in this room, without risking the stored enrollment.
+
+**Speaker turns inside one utterance** (change-point detection). The segmenter only cuts on pauses, so an interruption with no pause used to end up in the previous speaker's line. For a segment with at least 2 s of speech (`CT_TURN_MIN_SEGMENT_S`) and at least two enrolled people:
+
+1. Slide a 1.5 s window with a 0.5 s hop over the segment (`CT_TURN_WINDOW_S`, `CT_TURN_HOP_S`; at most 40 windows, embedded in one batch), skipping mostly silent windows.
+2. Label each window with its best-scoring person, or Unknown.
+3. Smooth: a single window that disagrees with both neighbours takes their label; then runs shorter than 1 s (`CT_TURN_MIN_S`) join the neighbour that fits them better.
+4. Cut between runs, midway between their window centres.
+
+With one turn, nothing changes. With several, Whisper's word timestamps assign each word to the turn containing its midpoint, and consecutive words of one turn become one line whose times snap to its first and last word. Without word timestamps (the null transcriber) the audio is cut at the turn boundaries and each piece is transcribed alone. Each piece of 1 s or more is then re-identified from its own audio, which is more accurate than 1.5 s windows; neighbouring pieces that end up with the same person are joined again, so a false split heals itself. Every piece is sent as its own utterance with its own `seq`.
+
+**Tuning.** Raise the threshold if people get mixed up; lower it if too many lines are Unknown. If lines get split when only one person spoke, raise `CT_TURN_MIN_S` or `CT_TURN_WINDOW_S`; if quick replies are missed, lower them. The MFCC fallback is much weaker and uses 0.80; it is meant for tests, not real rooms.
 
 ## Repo, running, and testing
 
@@ -214,29 +238,32 @@ First start downloads the Whisper and ECAPA models (a few hundred MB) from Huggi
 
 **Testing**
 
-- **Unit**: VAD on synthetic tones and silence; WAV decoding at other sample rates; embedder determinism; registry matching, Unknown, smoothing and persistence.
+- **Unit**: VAD on synthetic tones and silence; WAV decoding at other sample rates; embedder determinism and loudness normalisation; augmentation; registry matching, prototype scoring, adaptive prototypes, Unknown, smoothing and persistence; speaker-turn detection and smoothing; pipeline splitting with and without word timestamps.
 - **API**: every REST route and error code through FastAPI's `TestClient`.
-- **WebSocket end-to-end**: fake embedder and transcriber; checks ordering, ignored pre-start audio, malformed JSON.
+- **WebSocket end-to-end**: fake embedder and transcriber; checks ordering, an interruption without a pause becoming two lines, ignored pre-start audio, malformed JSON.
 - **Browser smoke test**: Playwright Chromium with a fake microphone; checks the page loads cleanly and enrollment works.
 
 **Adversarial review.** After the build agents finish, a separate reviewer agent that wrote none of the code reads the whole repo hunting for bugs: race conditions in the WebSocket worker, audio math errors, API contract mismatches, XSS, and resource leaks. Each confirmed finding is fixed with a regression test, then the suite is rerun.
 
 ## Limitations and roadmap
 
-V1 assumes people take turns. The biggest gaps are overlapping speech and speakers who never enrolled.
+V1 handles people taking turns, including interruptions without a pause. The biggest gaps are simultaneous speech and speakers who never enrolled.
 
 **Known limitations**
 
-- **Overlap**: if two people talk with no pause between them, the whole stretch goes to one speaker.
+- **Overlap**: when two people talk at the same time, the voices are not separated; each 1.5 s window goes to whichever voice dominates it, and the words are attributed to that speaker.
+- **Very quick exchanges**: a reply shorter than about 1 s with no pause before or after it is usually absorbed into the surrounding speaker's line (that is the price of not splitting on noise). Turn boundaries are accurate to roughly a quarter of a second before snapping to word timestamps.
 - **Short replies**: one-word utterances carry little voice information, so they are the most likely to be mislabeled.
+- **Large voice changes**: augmentation covers about ±2 semitones and loudness; shouting, whispering or a cold can still push a voice beyond that. Adding a sample in that voice helps; adaptive prototypes help during a session but are forgotten on restart.
 - **Room acoustics**: a far-away or echoey mic lowers similarity scores. Enroll in the same room and mic setup you will record in.
-- **CPU latency**: Whisper `base.en` on a laptop CPU takes roughly 0.3 to 1 s per utterance; `small.en` is more accurate but slower.
+- **CPU latency**: Whisper `base.en` on a laptop CPU takes roughly 0.3 to 1 s per utterance; `small.en` is more accurate but slower. Turn detection adds one batched embedding pass per segment of 2 s or more, and word timestamps add a little Whisper time when a segment has several speakers.
 - **Single room**: speakers are global to the server; there are no accounts or separate rooms.
 
 **Roadmap**
 
 1. **Approach two: automatic new-speaker discovery.** Reuse the same pipeline. When an utterance's best score is below the threshold, start a provisional cluster ("Person 3"). Later Unknown utterances join the nearest cluster if close enough, else start another. After about 10 s of speech, a cluster becomes a full speaker the user can rename. Enrollment then becomes optional.
-2. **Change-point detection inside an utterance**: embed 1.5 s sliding windows and split where similarity drops, to handle quick back-and-forth.
-3. **Adaptive centroids**: fold high-confidence utterances (score above 0.6) back into a speaker's centroid so recognition improves as the conversation goes on.
-4. **Neural VAD** (Silero) to replace the energy VAD in noisy rooms.
-5. **Persistence and export**: save sessions to SQLite; export JSON and SRT.
+2. **Overlap handling**: detect overlapped speech and, eventually, separate it (target-speaker extraction) so both people's words are kept.
+3. **Neural VAD** (Silero) to replace the energy VAD in noisy rooms.
+4. **Persistence and export**: save sessions to SQLite; export JSON and SRT.
+
+Done since the first version: change-point detection inside an utterance and adaptive per-speaker prototypes (see Speaker recognition), plus loudness normalisation and pitch/speed enrollment augmentation.

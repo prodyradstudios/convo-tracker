@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import threading
+from fractions import Fraction
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from scipy.fft import dct, rfft
+from scipy.signal import resample_poly
 
 from ..audio.io import SAMPLE_RATE
 
@@ -26,11 +29,78 @@ class Embedder(Protocol):
     def embed(self, audio: np.ndarray) -> np.ndarray: ...
 
 
+# Embedders may also offer ``embed_batch(list[np.ndarray]) -> np.ndarray`` (rows =
+# embeddings); :func:`embed_many` uses it when present.
+
+# Loudness normalisation (applied to every clip before it is embedded).
+TARGET_DBFS = -23.0
+PEAK_LIMIT = 0.99  # never push a sample past this (no clipping)
+_NORM_FRAME = 480  # 30 ms at 16 kHz, like the VAD
+_VOICED_RANGE_DB = 30.0  # frames within 30 dB of the loudest count as voiced
+_SILENCE_RMS = 1e-5  # about -100 dBFS: treat as silence, leave untouched
+_MAX_GAIN = 1000.0  # +60 dB at most
+
+# Enrollment augmentation: speed perturbation (pitch and tempo, about -1.8 / +1.65
+# semitones) and, when torchaudio is available, pure pitch shifts.
+SPEED_FACTORS = (0.9, 1.1)
+PITCH_STEPS = (-2.0, 2.0)
+
+
 def l2_normalize(vec: np.ndarray) -> np.ndarray:
     """Return ``vec`` scaled to unit length (zeros stay zeros)."""
     vec = np.asarray(vec, dtype=np.float32).reshape(-1)
     norm = float(np.linalg.norm(vec))
     return vec / norm if norm > 1e-12 else np.zeros_like(vec)
+
+
+def normalize_loudness(
+    audio: np.ndarray, target_dbfs: float = TARGET_DBFS, peak: float = PEAK_LIMIT
+) -> np.ndarray:
+    """Scale ``audio`` so its voiced frames have an RMS of ``target_dbfs``.
+
+    "Voiced" = 30 ms frames within 30 dB of the loudest frame, so pauses do not
+    drag the level down. The gain is limited so no sample exceeds ``peak`` and
+    to +60 dB; near-silent input is returned unchanged. Makes embeddings
+    independent of how loudly someone spoke or how far they sat from the mic.
+    """
+    x = np.nan_to_num(np.asarray(audio, dtype=np.float32).reshape(-1))
+    if x.size == 0:
+        return x
+    n = x.size // _NORM_FRAME
+    if n:
+        frames = x[: n * _NORM_FRAME].reshape(n, _NORM_FRAME).astype(np.float64)
+        rms = np.sqrt(np.mean(frames * frames, axis=1))
+    else:
+        rms = np.sqrt(np.mean(np.square(x, dtype=np.float64), keepdims=True))
+    loudest = float(rms.max())
+    if loudest < _SILENCE_RMS:
+        return x
+    voiced = rms >= loudest * 10.0 ** (-_VOICED_RANGE_DB / 20.0)
+    level = float(np.sqrt(np.mean(rms[voiced] ** 2)))
+    gain = 10.0 ** (target_dbfs / 20.0) / level
+    top = float(np.abs(x).max())
+    gain = min(gain, peak / top, _MAX_GAIN)
+    return (x * np.float32(gain)).astype(np.float32, copy=False)
+
+
+def prepare_audio(audio: np.ndarray) -> np.ndarray:
+    """Shared pre-processing of every embedder: float32 mono, loudness-normalised."""
+    return normalize_loudness(audio)
+
+
+def embed_many(embedder: Embedder, clips: Sequence[np.ndarray]) -> np.ndarray:
+    """Embed several clips: one ``embed_batch`` call if supported, else a loop.
+
+    Returns a ``(len(clips), dim)`` float32 array of L2-normalised rows.
+    """
+    if not clips:
+        return np.zeros((0, 0), dtype=np.float32)
+    batch = getattr(embedder, "embed_batch", None)
+    if callable(batch):
+        out = np.asarray(batch(list(clips)), dtype=np.float32)
+    else:
+        out = np.stack([np.asarray(embedder.embed(c), dtype=np.float32).reshape(-1) for c in clips])
+    return np.stack([l2_normalize(row) for row in out])
 
 
 def embed_windows(
@@ -43,8 +113,77 @@ def embed_windows(
     starts = list(range(0, audio.size - win + 1, hop))
     if starts[-1] + win < audio.size:
         starts.append(audio.size - win)  # cover the tail
-    embs = [embedder.embed(audio[s : s + win]) for s in starts]
+    embs = embed_many(embedder, [audio[s : s + win] for s in starts])
     return l2_normalize(np.mean(embs, axis=0))
+
+
+# --------------------------------------------------------------------------
+# Enrollment augmentation
+# --------------------------------------------------------------------------
+def speed_perturb(audio: np.ndarray, factor: float) -> np.ndarray:
+    """Play ``audio`` ``factor`` times faster: pitch and tempo both scale by ``factor``."""
+    ratio = Fraction(factor).limit_denominator(100)
+    # Output length = input / factor  ->  up = denominator, down = numerator.
+    out = resample_poly(np.asarray(audio, dtype=np.float32), ratio.denominator, ratio.numerator)
+    return out.astype(np.float32, copy=False)
+
+
+def _torchaudio_available() -> bool:
+    return all(importlib.util.find_spec(m) is not None for m in ("torch", "torchaudio"))
+
+
+def pitch_shift(audio: np.ndarray, n_steps: float, n_fft: int = 512) -> np.ndarray:
+    """Shift pitch by ``n_steps`` semitones keeping the duration (needs torchaudio).
+
+    Same algorithm as ``torchaudio.functional.pitch_shift`` (phase-vocoder time
+    stretch, then resample), but the resampling step uses ``resample_poly`` with
+    a small rational ratio: torchaudio's own resampler gets an awkward ratio
+    such as 17959/16000 for +2 semitones and takes many seconds per call.
+    """
+    import torch
+    import torchaudio.functional as taf
+
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    rate = 2.0 ** (-n_steps / 12.0)
+    hop = n_fft // 4
+    window = torch.hann_window(n_fft)
+    wav = torch.from_numpy(np.ascontiguousarray(audio))
+    with torch.no_grad():
+        spec = torch.stft(wav, n_fft, hop, window=window, return_complex=True)
+        advance = torch.linspace(0, math.pi * hop, spec.shape[-2])[..., None]
+        stretched = taf.phase_vocoder(spec, rate, advance)
+        length = int(round(audio.size / rate))
+        slow = torch.istft(stretched, n_fft, hop, window=window, length=length).numpy()
+    ratio = Fraction(rate).limit_denominator(64)
+    out = resample_poly(slow, ratio.numerator, ratio.denominator)
+    if out.size >= audio.size:
+        out = out[: audio.size]
+    else:
+        out = np.pad(out, (0, audio.size - out.size))
+    return out.astype(np.float32, copy=False)
+
+
+def augmented_copies(audio: np.ndarray) -> list[np.ndarray]:
+    """Perturbed copies of an enrollment recording (speed 0.9/1.1, pitch -/+2 st)."""
+    copies = [speed_perturb(audio, f) for f in SPEED_FACTORS]
+    if _torchaudio_available():
+        for steps in PITCH_STEPS:
+            try:
+                copies.append(pitch_shift(audio, steps))
+            except Exception:  # optional extra: never fail an enrollment over it
+                log.warning("pitch-shift augmentation failed; skipping it", exc_info=True)
+    return copies
+
+
+def enrollment_embeddings(
+    embedder: Embedder, speech: np.ndarray, augment: bool = True
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Embedding of an enrollment recording plus embeddings of its augmented copies."""
+    main = embed_windows(embedder, speech)
+    if not augment:
+        return main, []
+    extra = [embed_windows(embedder, copy) for copy in augmented_copies(speech)]
+    return main, [e for e in extra if np.all(np.isfinite(e)) and np.any(e)]
 
 
 # --------------------------------------------------------------------------
@@ -117,7 +256,7 @@ class MfccEmbedder:
         return dct(logmel, type=2, axis=1, norm="ortho")[:, 1 : self.n_mfcc + 1]
 
     def embed(self, audio: np.ndarray) -> np.ndarray:
-        mfcc = self._mfcc(audio)
+        mfcc = self._mfcc(prepare_audio(audio))
         feats = np.hstack([mfcc, _deltas(mfcc)])
         pooled = np.concatenate([feats.mean(axis=0), feats.std(axis=0)])
         pooled -= pooled.mean()
@@ -151,10 +290,25 @@ class EcapaEmbedder:
     def embed(self, audio: np.ndarray) -> np.ndarray:
         import torch
 
-        wav = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).unsqueeze(0)
+        wav = torch.from_numpy(np.ascontiguousarray(prepare_audio(audio))).unsqueeze(0)
         with self._lock, torch.no_grad():
             emb = self._model.encode_batch(wav)
         return l2_normalize(emb.squeeze().cpu().numpy())
+
+    def embed_batch(self, clips: list[np.ndarray]) -> np.ndarray:
+        """Embed clips of different lengths in one forward pass (zero-padded + wav_lens)."""
+        import torch
+
+        prepared = [prepare_audio(c) for c in clips]
+        longest = max(max(c.size for c in prepared), 1)
+        wavs = np.zeros((len(prepared), longest), dtype=np.float32)
+        for i, c in enumerate(prepared):
+            wavs[i, : c.size] = c
+        lens = torch.tensor([max(c.size, 1) / longest for c in prepared], dtype=torch.float32)
+        with self._lock, torch.no_grad():
+            emb = self._model.encode_batch(torch.from_numpy(wavs), wav_lens=lens)
+        rows = emb.reshape(len(prepared), -1).cpu().numpy()
+        return np.stack([l2_normalize(r) for r in rows])
 
 
 def _ecapa_available() -> bool:

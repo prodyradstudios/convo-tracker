@@ -75,6 +75,31 @@ def test_session_end_to_end(client):
     assert a["id"] != b["id"]
 
 
+@pytest.mark.parametrize("word_timing", [True, False])
+def test_interruption_without_pause_gives_two_utterances(make_client, word_timing):
+    from app.transcription.transcriber import NullTranscriber
+
+    client = make_client(transcriber=FakeTranscriber() if word_timing else NullTranscriber())
+    alice, bob = enroll(client, "Alice", 200), enroll(client, "Bob", 400)
+    # Alice talks for 3 s and Bob cuts in immediately: one VAD segment.
+    audio = np.concatenate([silence(1.0), tone(3.0, 200), tone(3.0, 400), silence(1.5)])
+    with client.websocket_connect("/ws/session") as ws:
+        ws.send_text('{"type":"start"}')
+        assert ws.receive_json()["state"] == "listening"
+        send_audio(ws, audio)
+        ws.send_text('{"type":"stop"}')
+        messages = receive_until_stopped(ws)
+    assert [m["active"] for m in messages if m["type"] == "speech"] == [True, False]
+    utts = utterances(messages)
+    assert [(u["seq"], u["speaker_id"]) for u in utts] == [(1, alice), (2, bob)]
+    a, b = utts
+    assert a["end"] <= b["start"] + 1e-6
+    assert b["start"] == pytest.approx(4.0, abs=0.5)
+    if word_timing:
+        assert (a["text"], b["text"]) == ("tone 200", "tone 400")
+    assert messages.index(b) < len(messages) - 1  # both before 'stopped'
+
+
 def test_unknown_speaker_and_empty_transcript(make_client):
     client = make_client(transcriber=FakeTranscriber(silent=(500,)))
     enroll(client, "Alice", 200)

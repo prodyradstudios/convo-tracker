@@ -16,10 +16,11 @@ The API contract lives in [`../docs/SPEC.md`](../docs/SPEC.md).
 | `api/session.py` | WebSocket `/ws/session`: receive loop + one worker task per connection; ML work runs in `asyncio.to_thread`. |
 | `audio/io.py` | WAV decode (any rate/channels → 16 kHz mono float32), PCM16 helpers. |
 | `audio/vad.py` | Streaming energy VAD / utterance `Segmenter`, `trim_silence`. |
-| `speakers/embedder.py` | `Embedder` protocol, `EcapaEmbedder` (SpeechBrain, lazy), `MfccEmbedder` (numpy/scipy). |
-| `speakers/registry.py` | Thread-safe `SpeakerRegistry`, cosine identification with continuity smoothing, atomic JSON persistence. |
-| `transcription/transcriber.py` | `WhisperTranscriber` (faster-whisper, lazy) and `NullTranscriber`. |
-| `pipeline.py` | `SessionPipeline`: segment → `Utterance`. |
+| `speakers/embedder.py` | `Embedder` protocol, `EcapaEmbedder` (SpeechBrain, lazy, batched), `MfccEmbedder` (numpy/scipy); loudness normalisation; enrollment augmentation (speed/pitch perturbation). |
+| `speakers/registry.py` | Thread-safe `SpeakerRegistry`: prototype scoring (centroid / top-2 prototypes), continuity smoothing, in-memory adaptive prototypes, atomic JSON persistence. |
+| `speakers/turns.py` | `detect_turns`: sliding-window speaker-change detection inside one segment. |
+| `transcription/transcriber.py` | `WhisperTranscriber` (faster-whisper, lazy; text or word timestamps) and `NullTranscriber`. |
+| `pipeline.py` | `SessionPipeline`: segment → turns → one `Utterance` per speaker turn. |
 
 ## Setup
 
@@ -60,6 +61,12 @@ Open http://127.0.0.1:8000 (the browser only allows the microphone on
 | `CT_MIN_UTTERANCE_S` | `0.5` | Drop utterances with less speech than this. |
 | `CT_WHISPER_MODEL` | `base.en` | faster-whisper model name. |
 | `CT_DEVICE` | `cpu` | `cpu` or `cuda` (int8 on CPU, float16 otherwise). |
+| `CT_TURN_MIN_SEGMENT_S` | `2.0` | Look for speaker changes only in segments with at least this much speech (>= 0). |
+| `CT_TURN_WINDOW_S` | `1.5` | Window length for speaker-change detection (0.25–10 s). |
+| `CT_TURN_HOP_S` | `0.5` | Window hop (> 0, <= window; grows to keep at most 40 windows per segment). |
+| `CT_TURN_MIN_S` | `1.0` | Speaker turns shorter than this are merged into a neighbour (>= 0). |
+| `CT_ENROLL_AUGMENT` | `1` | `1`/`0`: also store speed- and pitch-perturbed embeddings of each enrollment sample. |
+| `CT_ADAPT` | `1` | `1`/`0`: learn in-memory prototypes from very confident live speech (max 20 per person). |
 | `CT_HOST` / `CT_PORT` | `127.0.0.1` / `8000` | Used by `python -m app`. |
 
 ## Test

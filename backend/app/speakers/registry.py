@@ -9,9 +9,11 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -33,6 +35,13 @@ UNKNOWN_NAME = "Unknown"
 UNKNOWN_COLOR = "#888888"
 SHORT_UTTERANCE_S = 1.0
 CONTINUITY_MARGIN = 0.05
+# Prototype scoring: mean of the best TOP_K similarities to a speaker's prototypes.
+TOP_K = 2
+# Adaptive prototypes: confident live utterances become extra (in-memory) prototypes.
+ADAPT_MIN_SPEECH_S = 2.0
+ADAPT_SCORE_MARGIN = 0.15  # score must be >= threshold + this
+ADAPT_RIVAL_MARGIN = 0.10  # ... and beat the second-best speaker by this much
+ADAPT_MAX_PROTOTYPES = 20
 
 
 class DuplicateNameError(ValueError):
@@ -50,10 +59,24 @@ class SpeakerRecord:
     color: str
     created_at: float
     samples: list[np.ndarray] = field(default_factory=list)
+    # augmented[i] = embeddings of perturbed copies of sample i (may be empty).
+    augmented: list[list[np.ndarray]] = field(default_factory=list)
 
-    @property
+    def __post_init__(self) -> None:
+        if len(self.augmented) < len(self.samples):
+            self.augmented = [*self.augmented, *([] for _ in self.samples[len(self.augmented):])]
+
+    # Records are never mutated (mutations build a new one with replace()), so
+    # these derived arrays can be cached.
+    @cached_property
     def centroid(self) -> np.ndarray:
         return l2_normalize(np.mean(self.samples, axis=0))
+
+    @cached_property
+    def prototypes(self) -> np.ndarray:
+        """Real sample embeddings plus their augmented copies, one per row."""
+        rows = [*self.samples, *(e for aug in self.augmented for e in aug)]
+        return np.stack([l2_normalize(r) for r in rows])
 
     def to_public(self) -> dict[str, Any]:
         """The ``Speaker`` JSON object of the API."""
@@ -74,15 +97,43 @@ class Match:
     confidence: float
 
 
+@dataclass(frozen=True)
+class ScoreTable:
+    """Scores of several embeddings against every (compatible) enrolled speaker."""
+
+    speaker_ids: list[str]
+    scores: np.ndarray  # (n_embeddings, n_speakers)
+    threshold: float
+
+
+def _score_matrix(embs: np.ndarray, centroid: np.ndarray, prototypes: np.ndarray) -> np.ndarray:
+    """max(cos to centroid, mean of the top-2 cos to any prototype), per row of ``embs``."""
+    cent = embs @ centroid
+    sims = embs @ prototypes.T
+    k = min(TOP_K, sims.shape[1])
+    top = np.sort(sims, axis=1)[:, -k:].mean(axis=1)
+    return np.maximum(cent, top)
+
+
 class SpeakerRegistry:
     """Holds enrolled speakers. All public methods are thread-safe."""
 
-    def __init__(self, embedder_name: str, threshold: float, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        embedder_name: str,
+        threshold: float,
+        path: Path | None = None,
+        *,
+        adapt: bool = True,
+    ) -> None:
         self.embedder_name = embedder_name
         self.threshold = threshold
         self.path = Path(path) if path is not None else None
+        self.adapt = adapt
         self._lock = threading.RLock()
         self._speakers: dict[str, SpeakerRecord] = {}
+        # In-memory only: confident live embeddings per speaker (FIFO).
+        self._adaptive: dict[str, deque[np.ndarray]] = {}
         self._foreign: list[dict[str, Any]] = []  # other embedders' records, kept on disk
         self._warned_dim = False
         if self.path is not None:
@@ -109,8 +160,16 @@ class SpeakerRegistry:
     # -- mutations ----------------------------------------------------------
     # Each mutation builds the new state, saves it, and only then commits it to
     # memory, so a failed save leaves memory matching what is on disk.
-    def enroll(self, name: str, embedding: np.ndarray) -> dict[str, Any]:
-        """Create a speaker from one sample embedding. Raises DuplicateNameError."""
+    def enroll(
+        self,
+        name: str,
+        embedding: np.ndarray,
+        augmented: Sequence[np.ndarray] = (),
+    ) -> dict[str, Any]:
+        """Create a speaker from one sample embedding (plus its augmented copies).
+
+        Raises DuplicateNameError.
+        """
         name = name.strip()
         with self._lock:
             if self.has_name(name):
@@ -121,14 +180,24 @@ class SpeakerRegistry:
                 color=self._next_color(),
                 created_at=time.time(),
                 samples=[l2_normalize(embedding)],
+                augmented=[_clean_augmented(embedding, augmented)],
             )
             self._commit({**self._speakers, rec.id: rec}, self._foreign)
             return rec.to_public()
 
-    def add_sample(self, speaker_id: str, embedding: np.ndarray) -> dict[str, Any]:
+    def add_sample(
+        self,
+        speaker_id: str,
+        embedding: np.ndarray,
+        augmented: Sequence[np.ndarray] = (),
+    ) -> dict[str, Any]:
         with self._lock:
             rec = self._require(speaker_id)
-            rec = replace(rec, samples=[*rec.samples, l2_normalize(embedding)])
+            rec = replace(
+                rec,
+                samples=[*rec.samples, l2_normalize(embedding)],
+                augmented=[*rec.augmented, _clean_augmented(embedding, augmented)],
+            )
             self._commit({**self._speakers, rec.id: rec}, self._foreign)
             return rec.to_public()
 
@@ -137,28 +206,61 @@ class SpeakerRegistry:
             self._require(speaker_id)
             speakers = {k: v for k, v in self._speakers.items() if k != speaker_id}
             self._commit(speakers, self._foreign)
+            self._adaptive.pop(speaker_id, None)
 
     def clear(self) -> None:
         with self._lock:
             self._commit({}, [])
+            self._adaptive.clear()
+
+    def num_adaptive(self, speaker_id: str) -> int:
+        """Number of adaptive (in-memory) prototypes currently held for a speaker."""
+        with self._lock:
+            return len(self._adaptive.get(speaker_id, ()))
 
     # -- identification -----------------------------------------------------
+    def score(self, embeddings: np.ndarray) -> ScoreTable:
+        """Score each row of ``embeddings`` against every enrolled speaker.
+
+        score = max(cos(u, centroid), mean of the top-2 cos(u, prototype)) where a
+        speaker's prototypes are their real sample embeddings, the augmented
+        copies made at enrollment and any adaptive prototypes learnt live.
+        """
+        embs = np.atleast_2d(np.asarray(embeddings, dtype=np.float32))
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        embs = np.divide(embs, norms, out=np.zeros_like(embs), where=norms > 1e-12)
+        with self._lock:
+            speakers = self._compatible(embs.shape[1])
+            protos = [self._prototypes(s) for s in speakers]
+            threshold = self.threshold
+        cols = [_score_matrix(embs, s.centroid, p) for s, p in zip(speakers, protos)]
+        scores = np.stack(cols, axis=1) if cols else np.zeros((embs.shape[0], 0), np.float32)
+        return ScoreTable([s.id for s in speakers], scores, threshold)
+
     def identify(
-        self, embedding: np.ndarray, duration: float, previous_id: str | None = None
+        self,
+        embedding: np.ndarray,
+        duration: float,
+        previous_id: str | None = None,
+        *,
+        adapt: bool = False,
     ) -> Match:
-        """Best-matching speaker by cosine similarity, or Unknown below threshold.
+        """Best-matching speaker by prototype/centroid score, or Unknown below threshold.
 
         For short utterances (< 1 s) where the top two are within 0.05 and the
         previous identified speaker is one of them, the previous speaker wins.
+        With ``adapt=True`` (live utterances) a very confident match of at least
+        2 s of speech also becomes an adaptive prototype of that speaker.
         """
         emb = l2_normalize(embedding)
+        table = self.score(emb[None, :])
         with self._lock:
-            speakers = [s for s in self._speakers.values() if s.samples[0].shape == emb.shape]
-            if len(speakers) < len(self._speakers) and not self._warned_dim:
-                self._warned_dim = True
-                log.warning("skipping enrolled speaker(s) whose embedding size differs; re-enroll")
             scored = sorted(
-                ((float(np.dot(emb, s.centroid)), s) for s in speakers),
+                (
+                    (float(score), self._speakers[sid])
+                    for sid, score in zip(table.speaker_ids, table.scores[0])
+                    if sid in self._speakers
+                ),
                 key=lambda t: t[0],
                 reverse=True,
             )
@@ -174,9 +276,53 @@ class SpeakerRegistry:
             and scored[1][0] >= self.threshold
         ):
             best_score, best = scored[1]
-        if best_score >= self.threshold:
-            return Match(best.id, best.name, best.color, round(best_score, 3))
-        return Match(None, UNKNOWN_NAME, UNKNOWN_COLOR, round(best_score, 3))
+        if best_score < self.threshold:
+            return Match(None, UNKNOWN_NAME, UNKNOWN_COLOR, round(best_score, 3))
+        if adapt:
+            rival = max((sc for sc, s in scored if s.id != best.id), default=-1.0)
+            self._maybe_adapt(best.id, emb, duration, best_score, best_score - rival)
+        return Match(best.id, best.name, best.color, round(best_score, 3))
+
+    def match_for(self, speaker_id: str | None, score: float) -> Match:
+        """A Match for a known speaker id and score (Unknown if gone or below threshold)."""
+        with self._lock:
+            rec = self._speakers.get(speaker_id) if speaker_id is not None else None
+            if rec is None or score < self.threshold:
+                return Match(None, UNKNOWN_NAME, UNKNOWN_COLOR, round(float(score), 3))
+            return Match(rec.id, rec.name, rec.color, round(float(score), 3))
+
+    def _maybe_adapt(
+        self, speaker_id: str, emb: np.ndarray, duration: float, score: float, margin: float
+    ) -> bool:
+        """Add ``emb`` as an adaptive prototype if the match clears the strict bar."""
+        if not (
+            self.adapt
+            and duration >= ADAPT_MIN_SPEECH_S
+            and score >= self.threshold + ADAPT_SCORE_MARGIN
+            and margin >= ADAPT_RIVAL_MARGIN
+        ):
+            return False
+        with self._lock:
+            if speaker_id not in self._speakers:
+                return False  # deleted meanwhile
+            queue = self._adaptive.setdefault(speaker_id, deque(maxlen=ADAPT_MAX_PROTOTYPES))
+            queue.append(emb.astype(np.float32, copy=True))
+        return True
+
+    def _compatible(self, dim: int) -> list[SpeakerRecord]:
+        """Speakers whose embeddings have size ``dim`` (call with the lock held)."""
+        speakers = [s for s in self._speakers.values() if s.samples[0].size == dim]
+        if len(speakers) < len(self._speakers) and not self._warned_dim:
+            self._warned_dim = True
+            log.warning("skipping enrolled speaker(s) whose embedding size differs; re-enroll")
+        return speakers
+
+    def _prototypes(self, rec: SpeakerRecord) -> np.ndarray:
+        """Static prototypes plus adaptive ones (call with the lock held)."""
+        adaptive = self._adaptive.get(rec.id)
+        if not adaptive:
+            return rec.prototypes
+        return np.vstack([rec.prototypes, np.stack(list(adaptive))])
 
     # -- internals ----------------------------------------------------------
     def _require(self, speaker_id: str) -> SpeakerRecord:
@@ -259,6 +405,9 @@ class SpeakerRegistry:
                 "created_at": s.created_at,
                 "embedder": self.embedder_name,
                 "samples": [e.astype(float).round(6).tolist() for e in s.samples],
+                "augmented": [
+                    [e.astype(float).round(6).tolist() for e in aug] for aug in s.augmented
+                ],
             }
             for s in speakers.values()
         ]
@@ -276,6 +425,25 @@ class SpeakerRegistry:
             raise
 
 
+def _clean_augmented(embedding: np.ndarray, augmented: Sequence[np.ndarray]) -> list[np.ndarray]:
+    """Normalised augmented embeddings; drops any of the wrong size, non-finite or zero."""
+    size = np.asarray(embedding).size
+    out = []
+    for e in augmented:
+        e = np.asarray(e, dtype=np.float32).reshape(-1)
+        if e.size == size and np.all(np.isfinite(e)) and np.any(e):
+            out.append(l2_normalize(e))
+    return out
+
+
+def _check_vectors(vectors: list[np.ndarray], shape: tuple[int, ...], what: str) -> None:
+    for e in vectors:
+        if e.shape != shape:
+            raise ValueError(f"{what} differ in size")
+        if not np.all(np.abs(e) < 1e30) or not np.any(e):
+            raise ValueError(f"{what} must be finite and non-zero")
+
+
 def _parse_record(entry: dict[str, Any]) -> SpeakerRecord:
     """Build a record from a stored entry; raises on any malformed field."""
     samples = [np.asarray(e, dtype=np.float64) for e in entry["samples"]]
@@ -284,11 +452,19 @@ def _parse_record(entry: dict[str, Any]) -> SpeakerRecord:
     shape = samples[0].shape
     if len(shape) != 1 or shape[0] == 0:
         raise ValueError("samples must be non-empty 1-D vectors")
-    for e in samples:
-        if e.shape != shape:
-            raise ValueError("samples differ in size")
-        if not np.all(np.abs(e) < 1e30) or not np.any(e):
-            raise ValueError("samples must be finite and non-zero")
+    _check_vectors(samples, shape, "samples")
+    # Optional (files written before augmentation existed have no such field).
+    raw_aug = entry.get("augmented")
+    if raw_aug is None:
+        augmented: list[list[np.ndarray]] = [[] for _ in samples]
+    else:
+        if not isinstance(raw_aug, list) or len(raw_aug) != len(samples):
+            raise ValueError("'augmented' must be a list with one entry per sample")
+        if not all(isinstance(group, list) for group in raw_aug):
+            raise ValueError("'augmented' entries must be lists of vectors")
+        augmented = [[np.asarray(e, dtype=np.float64) for e in group] for group in raw_aug]
+        for group in augmented:
+            _check_vectors(group, shape, "augmented embeddings")
     for key in ("id", "name", "color"):
         if not isinstance(entry[key], str) or not entry[key]:
             raise ValueError(f"{key!r} must be a non-empty string")
@@ -301,4 +477,5 @@ def _parse_record(entry: dict[str, Any]) -> SpeakerRecord:
         color=entry["color"],
         created_at=created_at,
         samples=[e.astype(np.float32) for e in samples],
+        augmented=[[e.astype(np.float32) for e in group] for group in augmented],
     )

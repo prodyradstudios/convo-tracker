@@ -10,7 +10,7 @@ from starlette.types import Message
 
 from ..audio.io import AudioDecodeError, decode_wav, probe_duration
 from ..audio.vad import voiced_segments
-from ..speakers.embedder import embed_windows
+from ..speakers.embedder import enrollment_embeddings
 from ..speakers.registry import DuplicateNameError, SpeakerNotFoundError
 from ..state import AppState
 from .deps import get_state
@@ -49,11 +49,11 @@ async def create_speaker(request: Request, state: AppState = Depends(get_state))
         name = _validate_name(name if isinstance(name, str) else "")
         if state.registry.has_name(name):
             raise HTTPException(409, f"a person named {name!r} is already enrolled")
-        embedding = await _embed_upload(_file_field(form), state)
+        embedding, augmented = await _embed_upload(_file_field(form), state)
     finally:
         await form.close()
     try:
-        return state.registry.enroll(name, embedding)
+        return state.registry.enroll(name, embedding, augmented)
     except DuplicateNameError:
         raise HTTPException(409, f"a person named {name!r} is already enrolled") from None
 
@@ -65,11 +65,11 @@ async def add_sample(
     form = await _read_form(request)
     try:
         _ensure_exists(state, speaker_id)
-        embedding = await _embed_upload(_file_field(form), state)
+        embedding, augmented = await _embed_upload(_file_field(form), state)
     finally:
         await form.close()
     try:
-        return state.registry.add_sample(speaker_id, embedding)
+        return state.registry.add_sample(speaker_id, embedding, augmented)
     except SpeakerNotFoundError:
         raise HTTPException(404, "speaker not found") from None
 
@@ -136,8 +136,10 @@ def _ensure_exists(state: AppState, speaker_id: str) -> None:
         raise HTTPException(404, "speaker not found") from None
 
 
-async def _embed_upload(upload: UploadFile | None, state: AppState) -> np.ndarray:
-    """Validate an uploaded recording and return its enrollment embedding."""
+async def _embed_upload(
+    upload: UploadFile | None, state: AppState
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Validate an uploaded recording; return its embedding and augmented embeddings."""
     if upload is None:
         raise HTTPException(400, "missing 'audio' file")
     data = await upload.read(MAX_UPLOAD_BYTES + 1)
@@ -159,4 +161,6 @@ async def _embed_upload(upload: UploadFile | None, state: AppState) -> np.ndarra
             400, f"not enough speech: need at least {MIN_SPEECH_S:.0f} s, please speak longer"
         )
     speech = np.concatenate([s.audio for s in segments])
-    return await run_in_threadpool(embed_windows, state.embedder, speech)
+    return await run_in_threadpool(
+        enrollment_embeddings, state.embedder, speech, state.settings.enroll_augment
+    )

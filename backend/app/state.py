@@ -8,6 +8,7 @@ from .audio.vad import VadConfig
 from .config import Settings
 from .speakers.embedder import Embedder, build_embedder
 from .speakers.registry import SpeakerRegistry
+from .speakers.turns import TurnConfig
 from .transcription.transcriber import Transcriber, build_transcriber
 
 
@@ -27,6 +28,16 @@ class AppState:
             min_utterance_s=s.min_utterance_s,
         )
 
+    def turn_config(self) -> TurnConfig:
+        """Speaker-turn splitting configuration derived from settings."""
+        s = self.settings
+        return TurnConfig(
+            min_segment_s=s.turn_min_segment_s,
+            window_s=s.turn_window_s,
+            hop_s=s.turn_hop_s,
+            min_turn_s=s.turn_min_s,
+        )
+
 
 def build_state(
     settings: Settings,
@@ -44,6 +55,6 @@ def build_state(
         else embedder.default_threshold
     )
     registry = SpeakerRegistry(
-        embedder.name, threshold, settings.data_dir / "speakers.json"
+        embedder.name, threshold, settings.data_dir / "speakers.json", adapt=settings.adapt
     )
     return AppState(settings, embedder, transcriber, registry)

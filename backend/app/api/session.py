@@ -134,7 +134,7 @@ class SessionHandler:
             await self._end_pipeline(self.pipeline)
         st = self.state
         self.pipeline = SessionPipeline(
-            st.embedder, st.transcriber, st.registry, st.vad_config()
+            st.embedder, st.transcriber, st.registry, st.vad_config(), st.turn_config()
         )
         self._enqueue(_Started(self.pipeline))
 
@@ -209,12 +209,13 @@ class SessionHandler:
 
     async def _process(self, item: _Work) -> None:
         try:
-            utterance = await asyncio.to_thread(item.pipeline.process, item.segment)
+            # One segment can hold several speaker turns -> several utterances.
+            utterances = await asyncio.to_thread(item.pipeline.process, item.segment)
         except Exception:
             log.exception("failed to process utterance")
             await self._send({"type": "error", "message": "failed to process utterance"})
             return
-        if utterance is not None:
+        for utterance in utterances:
             await self._send(utterance.to_message())
 
     async def _send(self, payload: dict[str, Any]) -> None:
