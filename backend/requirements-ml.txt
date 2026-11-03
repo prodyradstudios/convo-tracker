@@ -1,0 +1,12 @@
+# Optional ML backends: ECAPA speaker embeddings (SpeechBrain) + faster-whisper STT.
+#
+# For CPU-only PyTorch wheels (much smaller, no CUDA) install with:
+#   pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+# If that index is unreachable pip falls back to PyPI's (CUDA) torch wheels, which
+# also run on CPU but download several GB.
+# Models are fetched from huggingface.co on first start (ECAPA + Whisper).
+-r requirements.txt
+faster-whisper>=1.0
+speechbrain>=1.0
+torch>=2.1
+torchaudio>=2.1
