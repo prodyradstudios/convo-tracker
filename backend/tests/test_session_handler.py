@@ -77,6 +77,9 @@ class GatedTranscriber:
         assert self.gate.wait(10), "gate never opened"
         return "words"
 
+    def transcribe_words(self, audio: np.ndarray) -> None:
+        return None  # no word timing
+
 
 def make_handler(transcriber) -> tuple[SessionHandler, FakeWS]:
     fake = FakeEmbedder()

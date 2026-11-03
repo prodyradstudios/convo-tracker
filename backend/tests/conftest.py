@@ -14,6 +14,7 @@ from app.audio.io import SAMPLE_RATE
 from app.config import Settings
 from app.main import create_app
 from app.speakers.embedder import l2_normalize
+from app.transcription.transcriber import Word
 
 SR = SAMPLE_RATE
 
@@ -95,6 +96,34 @@ class FakeTranscriber:
         freq = int(round(dominant_freq(audio) / 100.0)) * 100
         time.sleep(self.delays.get(freq, 0.0))
         return "" if freq in self.silent else f"tone {freq}"
+
+    def transcribe_words(self, audio: np.ndarray) -> list[Word]:
+        """Words "tone", "<freq>" for every run of one tone (first/second half of the run)."""
+        freq = int(round(dominant_freq(audio) / 100.0)) * 100
+        time.sleep(self.delays.get(freq, 0.0))
+        words: list[Word] = []
+        for f, start, end in tone_runs(audio):
+            if f not in self.silent:
+                mid = (start + end) / 2
+                words += [Word(" tone", start, mid), Word(f" {f}", mid, end)]
+        return words
+
+
+def tone_runs(audio: np.ndarray, block_s: float = 0.1) -> list[tuple[int, float, float]]:
+    """(freq rounded to 100 Hz, start s, end s) of each run of one tone, ignoring quiet blocks."""
+    block = int(block_s * SR)
+    runs: list[list] = []
+    for i in range(audio.size // block):
+        chunk = audio[i * block : (i + 1) * block]
+        if np.sqrt(np.mean(chunk.astype(np.float64) ** 2)) < 0.01:
+            continue
+        f = int(round(dominant_freq(chunk) / 100.0)) * 100
+        t0, t1 = i * block_s, (i + 1) * block_s
+        if runs and runs[-1][0] == f and abs(runs[-1][2] - t0) < 1e-9:
+            runs[-1][2] = t1
+        else:
+            runs.append([f, t0, t1])
+    return [(f, round(a, 3), round(b, 3)) for f, a, b in runs if b - a >= 0.2]
 
 
 # -- fixtures ---------------------------------------------------------------

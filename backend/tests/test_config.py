@@ -39,7 +39,9 @@ def test_threshold_defaults_to_embedder_and_can_be_overridden(tmp_path):
     assert st.registry.threshold == FakeEmbedder.default_threshold
     st = build_state(Settings(data_dir=tmp_path, match_threshold=0.9), FakeEmbedder(), FakeTranscriber())
     assert st.registry.threshold == 0.9
-    vad = build_state(Settings(data_dir=tmp_path, silence_ms=300), FakeEmbedder()).vad_config()
+    vad = build_state(
+        Settings(data_dir=tmp_path, silence_ms=300), FakeEmbedder(), FakeTranscriber()
+    ).vad_config()
     assert vad.silence_ms == 300
 
 
@@ -70,3 +72,54 @@ def test_edge_values_accepted():
                            "CT_MAX_UTTERANCE_S": "0.1", "CT_SILENCE_MS": "1"})
     assert s.match_threshold == -1.0 and s.min_utterance_s == 0.0
     assert Settings(match_threshold=1.0).match_threshold == 1.0
+
+
+def test_turn_and_robustness_defaults_and_overrides(tmp_path):
+    s = Settings.from_env({})
+    assert (s.turn_min_segment_s, s.turn_window_s, s.turn_hop_s, s.turn_min_s) == (2.0, 1.5, 0.5, 1.0)
+    assert s.enroll_augment is True and s.adapt is True
+    s = Settings.from_env({
+        "CT_TURN_MIN_SEGMENT_S": "3", "CT_TURN_WINDOW_S": "2", "CT_TURN_HOP_S": "0.25",
+        "CT_TURN_MIN_S": "0", "CT_ENROLL_AUGMENT": "0", "CT_ADAPT": "false",
+    })
+    assert (s.turn_min_segment_s, s.turn_window_s, s.turn_hop_s, s.turn_min_s) == (3.0, 2.0, 0.25, 0.0)
+    assert s.enroll_augment is False and s.adapt is False
+    assert Settings.from_env({"CT_ADAPT": "Yes", "CT_ENROLL_AUGMENT": "1"}).adapt is True
+    st = build_state(
+        Settings(data_dir=tmp_path, turn_hop_s=0.3, adapt=False), FakeEmbedder(), FakeTranscriber()
+    )
+    turns = st.turn_config()
+    assert (turns.min_segment_s, turns.window_s, turns.hop_s, turns.min_turn_s) == (2.0, 1.5, 0.3, 1.0)
+    assert st.registry.adapt is False
+
+
+@pytest.mark.parametrize(
+    ("env", "word"),
+    [
+        ({"CT_TURN_MIN_SEGMENT_S": "-1"}, "CT_TURN_MIN_SEGMENT_S"),
+        ({"CT_TURN_MIN_SEGMENT_S": "nan"}, "CT_TURN_MIN_SEGMENT_S"),
+        ({"CT_TURN_MIN_SEGMENT_S": "abc"}, "CT_TURN_MIN_SEGMENT_S"),
+        ({"CT_TURN_WINDOW_S": "0.1"}, "CT_TURN_WINDOW_S"),
+        ({"CT_TURN_WINDOW_S": "inf"}, "CT_TURN_WINDOW_S"),
+        ({"CT_TURN_WINDOW_S": "11"}, "CT_TURN_WINDOW_S"),
+        ({"CT_TURN_HOP_S": "0"}, "CT_TURN_HOP_S"),
+        ({"CT_TURN_HOP_S": "2"}, "CT_TURN_HOP_S"),  # > window (1.5)
+        ({"CT_TURN_HOP_S": "nan"}, "CT_TURN_HOP_S"),
+        ({"CT_TURN_MIN_S": "-0.5"}, "CT_TURN_MIN_S"),
+        ({"CT_TURN_MIN_S": "inf"}, "CT_TURN_MIN_S"),
+        ({"CT_ENROLL_AUGMENT": "maybe"}, "CT_ENROLL_AUGMENT"),
+        ({"CT_ADAPT": "2"}, "CT_ADAPT"),
+    ],
+)
+def test_invalid_turn_and_robustness_settings(env, word):
+    with pytest.raises(ValueError, match=word):
+        Settings.from_env(env)
+
+
+def test_turn_edge_values_accepted():
+    s = Settings.from_env({"CT_TURN_WINDOW_S": "0.25", "CT_TURN_HOP_S": "0.25",
+                           "CT_TURN_MIN_SEGMENT_S": "0", "CT_TURN_MIN_S": "0"})
+    assert s.turn_window_s == s.turn_hop_s == 0.25
+    assert Settings(turn_window_s=10.0, turn_hop_s=10.0).turn_hop_s == 10.0
+    with pytest.raises(ValueError, match="CT_ADAPT"):
+        Settings(adapt=1)  # type: ignore[arg-type]

@@ -11,10 +11,12 @@ Version 1 enrolls voices first. Each person records a short voice sample and typ
 
 ## Quick start
 
+Requires **Python 3.11–3.13** (3.12 recommended). Check with `python3 --version`. On a Mac, `brew install python@3.12` and use `python3.12` below.
+
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r backend/requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -r backend/requirements-ml.txt
 cd backend && python -m app
 ```
 
@@ -23,6 +25,10 @@ Open <http://localhost:8000>. Browsers only allow the microphone on `localhost` 
 1. In **People**, type a name, press **Record**, speak for about 8 seconds, and press **Stop**. Repeat this for everyone. Use **+ sample** to improve a person's match.
 2. In **Conversation**, press **Start listening** and talk.
 3. Press **Stop listening** when you're done. **Export** downloads the transcript as `.txt`.
+
+On Linux or Windows, add `--extra-index-url https://download.pytorch.org/whl/cpu` to the install line for smaller CPU-only PyTorch.
+
+If the install fails with `pkg-config is required for building PyAV`, your Python is too new or too old for the prebuilt packages. Delete `.venv` and recreate it with Python 3.12.
 
 The first start downloads the Whisper (`base.en`) and ECAPA models from Hugging Face. If those packages aren't installed, run `pip install -r backend/requirements.txt` instead. The app then falls back to a weak MFCC speaker matcher and placeholder transcripts, which is useful for development only.
 

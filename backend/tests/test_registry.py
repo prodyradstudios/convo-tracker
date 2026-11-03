@@ -243,3 +243,280 @@ def test_concurrent_duplicate_enroll_only_one_wins(reg):
     for t in threads:
         t.join()
     assert results.count("ok") == 1 and len(reg) == 1
+
+
+# -- augmented prototypes ---------------------------------------------------------------
+def unit(*values: float) -> np.ndarray:
+    v = vec(*values)
+    return v / np.linalg.norm(v)
+
+
+def test_augmented_embeddings_are_stored_and_persisted(path, reg):
+    a = reg.enroll("Alice", vec(1, 0, 0), [vec(0.8, 0.6, 0), vec(0.8, 0, 0.6)])
+    assert a["num_samples"] == 1  # real samples only
+    assert reg.add_sample(a["id"], vec(0.9, 0.1, 0))["num_samples"] == 2  # no augmentation
+    entry = json.loads(path.read_text())["speakers"][0]
+    assert len(entry["samples"]) == 2
+    assert [len(group) for group in entry["augmented"]] == [2, 0]
+    assert entry["augmented"][0][0] == pytest.approx([0.8, 0.6, 0.0])
+    again = SpeakerRegistry("fake", 0.5, path)
+    assert again.list() == reg.list()
+    q = unit(0.8, 0.6, 0)
+    assert again.identify(q, 2.0).confidence == reg.identify(q, 2.0).confidence
+
+
+def test_old_files_without_augmented_field_still_load(path):
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"version": 1, "speakers": [
+        {"id": "a1", "name": "Alice", "color": "#e6194b", "created_at": 1.0,
+         "embedder": "fake", "samples": [[1, 0, 0]]},
+    ]}))
+    reg = SpeakerRegistry("fake", 0.5, path)
+    assert [s["name"] for s in reg.list()] == ["Alice"]
+    assert reg.identify(vec(1, 0, 0), 2.0).confidence == 1.0
+    reg.add_sample("a1", vec(0, 1, 0), [vec(0, 0.8, 0.6)])
+    entry = json.loads(path.read_text())["speakers"][0]
+    assert [len(g) for g in entry["augmented"]] == [0, 1]
+
+
+def test_invalid_augmented_entries_are_skipped(path, caplog):
+    def entry(id_, augmented):
+        return {"embedder": "fake", "id": id_, "name": id_, "color": "#000000",
+                "created_at": 1.0, "samples": [[1, 0]], "augmented": augmented}
+
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"speakers": [
+        entry("wrongcount", [[], []]),
+        entry("notlist", "x"),
+        entry("notgroups", [[1, 0]]),
+        entry("wrongdim", [[[1, 0, 0]]]),
+        entry("zero", [[[0, 0]]]),
+        entry("huge", [[[1e39, 0]]]),
+        entry("ok", [[[0.6, 0.8]]]),
+        entry("empty-ok", [[]]),
+    ]}))
+    with caplog.at_level("WARNING"):
+        reg = SpeakerRegistry("fake", 0.5, path)
+    assert [s["name"] for s in reg.list()] == ["ok", "empty-ok"]
+    assert "invalid" in caplog.text
+
+
+def test_prototype_scoring_uses_top2_of_all_prototypes(reg):
+    a = reg.enroll("Alice", vec(1, 0, 0), [unit(0.6, 0.8, 0)])["id"]
+    reg.enroll("Bob", vec(0, 0, 1))
+    q = unit(0.6, 0.8, 0)
+    # centroid: 0.6; prototypes {sample: 0.6, augmented: 1.0} -> mean of top 2 = 0.8
+    m = reg.identify(q, 2.0)
+    assert m.speaker_id == a and m.confidence == pytest.approx(0.8)
+    # The centroid still wins when it is the better match.
+    reg2 = SpeakerRegistry("fake", 0.5)
+    reg2.enroll("Carol", vec(1, 0, 0))
+    cid = reg2.list()[0]["id"]
+    reg2.add_sample(cid, vec(0, 1, 0))
+    assert reg2.identify(vec(1, 1, 0), 2.0).confidence == pytest.approx(1.0)
+    table = reg.score(np.stack([q, vec(0, 0, 1)]))
+    assert table.scores.shape == (2, 2) and table.threshold == 0.5
+    assert table.scores[1, 1] == pytest.approx(1.0)
+
+
+ALICE = (120, [(700, 150), (1200, 200), (2600, 300)])
+BOB = (210, [(400, 150), (2000, 200), (2900, 300)])
+CAROL = (160, [(550, 150), (1600, 200), (2700, 300)])
+
+
+def test_augmentation_helps_pitch_shifted_voice():
+    from app.speakers.embedder import MfccEmbedder, enrollment_embeddings, speed_perturb
+    from conftest import voice
+
+    emb = MfccEmbedder()
+    plain = SpeakerRegistry(emb.name, emb.default_threshold)
+    augmented = SpeakerRegistry(emb.name, emb.default_threshold)
+    ids = {}
+    for name, (f0, formants), seed in (("Alice", ALICE, 1), ("Bob", BOB, 2), ("Carol", CAROL, 3)):
+        main, extra = enrollment_embeddings(emb, voice(f0, formants, seconds=6.0, seed=seed))
+        assert len(extra) >= 2
+        plain.enroll(name, main)
+        ids[name] = augmented.enroll(name, main, extra)["id"]
+    for name, (f0, formants) in (("Alice", ALICE), ("Bob", BOB), ("Carol", CAROL)):
+        # Same person, different take, speaking about 1.65 semitones higher.
+        query = emb.embed(speed_perturb(voice(f0, formants, seconds=3.0, seed=11), 1.1))
+        before = plain.score(query[None, :])  # same speaker order as `augmented`
+        after = augmented.score(query[None, :])
+        col = after.speaker_ids.index(ids[name])
+        centroid_only = float(before.scores[0, col])
+        with_protos = float(after.scores[0, col])
+        assert with_protos > centroid_only + 0.05, name
+        assert after.scores[0].argmax() == col  # still the right person
+        assert augmented.identify(query, 3.0).speaker_id == ids[name]
+
+
+# -- adaptive prototypes ---------------------------------------------------------------
+@pytest.fixture
+def pair(path):
+    reg = SpeakerRegistry("fake", 0.5, path)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    b = reg.enroll("Bob", vec(0, 1, 0))["id"]
+    return reg, a, b
+
+
+def test_adaptive_prototype_added_only_above_strict_bar(pair):
+    reg, a, b = pair
+    confident = unit(0.9, 0.3, 0.1)  # Alice ~0.94, Bob ~0.31
+    assert reg.identify(confident, 3.0).speaker_id == a
+    assert reg.num_adaptive(a) == 0  # adapt not requested
+    reg.identify(confident, 1.9, adapt=True)
+    assert reg.num_adaptive(a) == 0  # too short (< 2 s of speech)
+    reg.identify(unit(0.62, 0.0, 0.78), 3.0, adapt=True)  # 0.62 < threshold + 0.15
+    reg.identify(unit(0.75, 0.7, 0.0), 3.0, adapt=True)  # margin over Bob ~0.05 < 0.10
+    reg.identify(unit(0.3, 0.1, 0.95), 3.0, adapt=True)  # Unknown
+    assert reg.num_adaptive(a) == reg.num_adaptive(b) == 0
+    reg.identify(confident, 2.0, adapt=True)
+    assert reg.num_adaptive(a) == 1 and reg.num_adaptive(b) == 0
+
+
+def test_adaptive_prototypes_raise_scores_capped_and_not_persisted(path, pair):
+    reg, a, b = pair
+    confident = unit(0.9, 0.3, 0.1)
+    near = unit(0.85, 0.35, 0.15)
+    before = reg.identify(near, 2.0).confidence
+    reg.identify(confident, 3.0, adapt=True)
+    assert reg.identify(near, 2.0).confidence > before
+    for _ in range(25):
+        reg.identify(confident, 3.0, adapt=True)
+    assert reg.num_adaptive(a) == 20  # FIFO cap
+    data = json.loads(path.read_text())
+    assert all("adaptive" not in s for s in data["speakers"])
+    assert SpeakerRegistry("fake", 0.5, path).num_adaptive(a) == 0  # memory only
+
+
+def test_adaptive_prototypes_cleared_on_delete(pair):
+    reg, a, b = pair
+    reg.identify(unit(0.9, 0.3, 0.1), 3.0, adapt=True)
+    reg.identify(unit(0.3, 0.9, 0.1), 3.0, adapt=True)
+    assert reg.num_adaptive(a) == reg.num_adaptive(b) == 1
+    reg.delete(a)
+    assert reg.num_adaptive(a) == 0 and reg.num_adaptive(b) == 1
+    reg.clear()
+    assert reg.num_adaptive(b) == 0
+
+
+def test_adaptation_can_be_disabled(path):
+    reg = SpeakerRegistry("fake", 0.5, path, adapt=False)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    reg.identify(unit(0.9, 0.3, 0.1), 3.0, adapt=True)
+    assert reg.num_adaptive(a) == 0
+
+
+def test_adaptation_is_thread_safe(pair):
+    reg, a, _ = pair
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            for _ in range(50):
+                reg.identify(unit(0.9, 0.3, 0.1), 3.0, adapt=True)
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and reg.num_adaptive(a) == 20
+
+
+def test_bad_augmented_embeddings_are_dropped_on_enroll(reg):
+    a = reg.enroll("Alice", vec(1, 0, 0), [vec(1, 0), vec(np.nan, 0, 0), vec(0, 0, 0), vec(0, 2, 0)])
+    q = unit(0, 1, 0)
+    # Only (0, 1, 0) survived (normalised): top-2 mean = (0 + 1) / 2.
+    assert reg.identify(q, 2.0).confidence == pytest.approx(0.5)
+    assert reg.get(a["id"])["num_samples"] == 1
+
+
+# -- adaptation cannot drift (adversarial review) ----------------------------------------
+def _drift_world():
+    """Alice, Bob and a never-enrolled stranger S on orthonormal axes (ECAPA-like 0.30)."""
+    rng = np.random.default_rng(0)
+    q, _ = np.linalg.qr(rng.standard_normal((192, 4)))
+    alice, bob, stranger, _ = q.T
+    reg = SpeakerRegistry("ecapa", 0.30)
+    a = reg.enroll("Alice", alice)["id"]
+    reg.enroll("Bob", bob)
+
+    def mix(c_alice: float, seed: int = 0, noise: float = 0.0) -> np.ndarray:
+        r = np.random.default_rng(seed)
+        v = c_alice * alice + np.sqrt(1 - c_alice**2) * stranger + noise * r.standard_normal(192)
+        return v / np.linalg.norm(v)
+
+    return reg, a, mix
+
+
+def test_stranger_stream_cannot_take_over_an_enrolled_speaker():
+    """A stranger's utterances drift away from Alice a little at a time.
+
+    The first ones are (barely) confident Alice matches. Adaptive prototypes
+    learnt from them must not vouch for the next ones, and must never make the
+    stranger's own voice a match.
+    """
+    reg, a, mix = _drift_world()
+    probe = mix(0.20)
+    assert reg.identify(probe, 3.0).speaker_id is None
+    for k, c in enumerate([0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] * 3):
+        reg.identify(mix(c, seed=k, noise=0.004), 3.0, adapt=True)
+    assert reg.num_adaptive(a) <= 6  # only the statically confident ones (0.50 / 0.45)
+    m = reg.identify(probe, 3.0)
+    assert m.speaker_id is None and m.confidence == pytest.approx(0.2, abs=0.01)
+    # A long stream of the stranger alone stays Unknown.
+    for k in range(40):
+        assert reg.identify(mix(0.2, seed=100 + k, noise=0.004), 3.0, adapt=True).speaker_id is None
+
+
+def test_adaptation_gates_use_static_scores():
+    reg = SpeakerRegistry("fake", 0.5)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    near = unit(np.cos(np.radians(30)), 0, np.sin(np.radians(30)))  # static 0.866
+    for _ in range(3):
+        reg.identify(near, 3.0, adapt=True)
+    assert reg.num_adaptive(a) == 3
+    # 52 deg from Alice: static 0.616 < 0.65. Adaptive prototypes at 30 deg make the
+    # full score ~0.93, but that must not count for adaptation.
+    far = unit(np.cos(np.radians(52)), 0, np.sin(np.radians(52)))
+    assert reg.identify(far, 3.0).confidence > 0.9
+    reg.identify(far, 3.0, adapt=True)
+    assert reg.num_adaptive(a) == 3
+
+
+def test_adaptive_prototypes_never_lift_a_score_over_the_threshold():
+    reg = SpeakerRegistry("fake", 0.5)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    for _ in range(3):
+        reg.identify(unit(0.8, 0, 0.6), 3.0, adapt=True)  # static 0.8: adapted
+    assert reg.num_adaptive(a) == 3
+    weak = unit(0.4, 0, 0.92)  # static 0.40 (Unknown); ~0.98 to the adaptive prototypes
+    assert reg.identify(weak, 3.0).speaker_id is None
+    assert reg.score(weak[None, :]).scores[0].max() == pytest.approx(0.40, abs=0.01)
+
+
+def test_single_enrolled_speaker_needs_a_wider_margin_to_adapt():
+    reg = SpeakerRegistry("fake", 0.5)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.identify(unit(0.7, 0, 0.71), 3.0, adapt=True)  # 0.70 >= thr + 0.15 but < thr + 0.25
+    assert reg.num_adaptive(a) == 0
+    reg.identify(unit(0.8, 0, 0.6), 3.0, adapt=True)  # 0.80 >= thr + 0.25
+    assert reg.num_adaptive(a) == 1
+
+
+def test_adaptation_requires_centroid_similarity():
+    """A match carried by one augmented prototype (centroid far away) is not adapted."""
+    reg = SpeakerRegistry("fake", 0.5)
+    aug = [unit(0, 0, 1), unit(0, 0.05, 1)]  # augmented copies far from the sample
+    a = reg.enroll("Alice", vec(1, 0, 0), augmented=aug)["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    u = unit(0.3, 0, 1)  # cos to centroid 0.29; top-2 prototype mean ~0.95
+    m = reg.identify(u, 3.0, adapt=True)
+    assert m.speaker_id == a and m.confidence > 0.9
+    assert reg.num_adaptive(a) == 0

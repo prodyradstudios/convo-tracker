@@ -234,3 +234,26 @@ def test_missing_frontend_dir_does_not_crash(tmp_path, settings):
     app = create_app(settings, embedder=MfccEmbedder(), frontend_dir=tmp_path / "nope")
     with TestClient(app) as c:
         assert c.get("/api/health").status_code == 200
+
+
+def test_enrollment_stores_augmented_embeddings(make_client, settings):
+    import json
+
+    client = make_client()
+    sid = enroll(client, "Alice").json()["id"]
+    r = client.post(f"/api/speakers/{sid}/samples", files={"audio": ("a.wav", speech_wav(), "audio/wav")})
+    assert r.json()["num_samples"] == 2  # augmented copies are not counted
+    entry = json.loads((settings.data_dir / "speakers.json").read_text())["speakers"][0]
+    assert len(entry["samples"]) == 2
+    assert [len(g) >= 2 for g in entry["augmented"]] == [True, True]  # speed 0.9/1.1 (+ pitch)
+
+
+def test_enrollment_augmentation_can_be_disabled(make_client, tmp_path):
+    import json
+
+    off = Settings(data_dir=tmp_path / "off", embedder="mfcc", transcriber="null",
+                   enroll_augment=False)
+    client = make_client(settings=off)
+    assert enroll(client, "Alice").status_code == 201
+    entry = json.loads((off.data_dir / "speakers.json").read_text())["speakers"][0]
+    assert entry["augmented"] == [[]]
