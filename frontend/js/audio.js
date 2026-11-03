@@ -6,6 +6,20 @@ let workletReady = null; // Promise for addModule on sharedContext
 
 const WORKLET_URL = new URL('./pcm-worklet.js', import.meta.url);
 
+// getUserMedia may sit behind a permission prompt, so it gets a generous limit;
+// the rest (worklet load + context resume) should be quick.
+const PERMISSION_TIMEOUT_MS = 60000;
+const AUDIO_INIT_TIMEOUT_MS = 10000;
+
+/** Reject with `message` if `promise` has not settled within `ms`. */
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(message), { timeout: true })), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** Lazily create the single shared AudioContext. Call from a user gesture. */
 export function getAudioContext() {
   if (!sharedContext || sharedContext.state === 'closed') {
@@ -15,6 +29,32 @@ export function getAudioContext() {
     workletReady = null;
   }
   return sharedContext;
+}
+
+function loadWorklet(ctx) {
+  if (!workletReady) {
+    workletReady = ctx.audioWorklet.addModule(WORKLET_URL).catch((e) => {
+      workletReady = null;
+      throw e;
+    });
+  }
+  return workletReady;
+}
+
+/**
+ * Create and resume the shared AudioContext (and start loading the worklet).
+ * Call synchronously at the top of a click handler, before any `await`:
+ * Safari/iOS only let a context start inside the user gesture. Never throws;
+ * problems surface later from MicCapture.start().
+ */
+export function primeAudio() {
+  try {
+    const ctx = getAudioContext();
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    if (typeof AudioWorkletNode !== 'undefined' && ctx.audioWorklet) loadWorklet(ctx).catch(() => {});
+  } catch {
+    /* reported by MicCapture.start() */
+  }
 }
 
 function friendlyMicError(err) {
@@ -76,26 +116,30 @@ export class MicCapture {
       throw e;
     }
     const resumed = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
+    resumed.catch(() => {}); // awaited (with a timeout) below
 
     let stream;
+    const gum = navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      stream = await withTimeout(gum, PERMISSION_TIMEOUT_MS, 'getUserMedia timed out');
     } catch (err) {
       if (gen === this._gen) this.running = false;
+      if (err && err.timeout) {
+        // If the prompt is answered later, release the device straight away.
+        gum.then((s) => s.getTracks().forEach((t) => t.stop()), () => {});
+        throw new Error('The microphone did not start in time. Check for a microphone permission prompt and try again.');
+      }
       throw new Error(friendlyMicError(err));
     }
 
     try {
-      if (!workletReady) {
-        workletReady = ctx.audioWorklet.addModule(WORKLET_URL).catch((e) => {
-          workletReady = null;
-          throw e;
-        });
-      }
-      await workletReady;
-      await resumed;
+      await withTimeout(
+        Promise.all([loadWorklet(ctx), resumed]),
+        AUDIO_INIT_TIMEOUT_MS,
+        'the browser did not start audio in time (tap the button again)',
+      );
     } catch (err) {
       stream.getTracks().forEach((t) => t.stop());
       if (gen === this._gen) this.running = false;

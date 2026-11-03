@@ -1,13 +1,17 @@
 // UI wiring for Convo Tracker. All server/user text is rendered with textContent.
 
 import * as api from './api.js';
-import { MicCapture } from './audio.js';
+import { MicCapture, primeAudio } from './audio.js';
 import { encodeWav } from './wav.js';
 import { SessionClient } from './session.js';
 
 const MIN_RECORD_S = 3;
 const MAX_RECORD_S = 15;
-const STOP_TIMEOUT_MS = 10000;
+// After Stop the server may still be transcribing (CPU Whisper can be slow), so
+// give up only after this much silence from it, or after the hard cap.
+const STOP_IDLE_TIMEOUT_MS = 15000;
+const STOP_MAX_MS = 120000;
+const SPEAKERS_RETRY_MAX_MS = 15000;
 const SAMPLE_RATE = 16000;
 const UNKNOWN_COLOR = '#888888';
 
@@ -43,12 +47,16 @@ const mic = new MicCapture();
 const state = {
   speakers: [],
   loadedSpeakers: false,
+  speakersError: null, // message while the initial load keeps failing
+  speakersVersion: 0, // bumped on every local change to `speakers`
   /** 'idle' | 'recording' | 'saving' | 'connecting' | 'listening' | 'finishing' */
   mode: 'idle',
   busy: 0, // in-flight people requests (delete etc.)
   recording: null, // { target: {kind:'new', name} | {kind:'sample', id, name}, chunks, samples, startedAt, timer }
   session: null,
   stopTimer: null,
+  finishDeadline: 0, // performance.now() after which finishing gives up regardless
+  lastServerError: null, // last {"type":"error"} message of the current session
   lines: [], // { kind:'utterance', ...u } | { kind:'separator' }
   seenIds: new Set(),
   sessionCount: 0,
@@ -147,7 +155,13 @@ function render() {
     li.classList.toggle('recording', !!rec && rec.target.kind === 'sample' && rec.target.id === li.dataset.id);
   }
   el.removeAll.disabled = !hasPeople || peopleLocked;
-  el.peopleEmpty.hidden = hasPeople || !state.loadedSpeakers;
+  if (!state.loadedSpeakers) {
+    el.peopleEmpty.textContent = state.speakersError ? 'Couldn’t load people — retrying…' : 'Loading people…';
+    el.peopleEmpty.hidden = false;
+  } else {
+    el.peopleEmpty.textContent = 'Nobody enrolled yet.';
+    el.peopleEmpty.hidden = hasPeople;
+  }
 
   // Listen button
   el.listen.classList.toggle('active', mode === 'listening' || mode === 'finishing');
@@ -169,7 +183,9 @@ function render() {
       el.listen.disabled = !hasPeople || mode !== 'idle';
   }
   if (!hasPeople && !isListeningMode()) {
-    el.listenHint.textContent = 'Enroll at least one person to start listening.';
+    if (state.loadedSpeakers) el.listenHint.textContent = 'Enroll at least one person to start listening.';
+    else if (state.speakersError) el.listenHint.textContent = 'Couldn’t load people — retrying…';
+    else el.listenHint.textContent = 'Loading people…';
     el.listenHint.hidden = false;
   } else if (isEnrollMode()) {
     el.listenHint.textContent = 'Finish the voice recording first.';
@@ -282,20 +298,59 @@ function isNearBottom() {
 
 // ---------- people ----------
 
-async function refreshSpeakers() {
-  try {
-    state.speakers = await api.listSpeakers();
-    state.loadedSpeakers = true;
-    renderPeople();
-  } catch (err) {
-    showBanner(`Could not load people: ${err.message}`);
-  }
+const speakersLoad = { inFlight: null, retryTimer: null, retryDelay: 1000 };
+
+/**
+ * (Re)load the people list. Until the first load succeeds, failures are retried
+ * with exponential backoff (1 s, 2 s, 4 s … capped at 15 s).
+ */
+function refreshSpeakers() {
+  if (speakersLoad.inFlight) return speakersLoad.inFlight;
+  clearTimeout(speakersLoad.retryTimer);
+  speakersLoad.retryTimer = null;
+  speakersLoad.inFlight = (async () => {
+    try {
+      let list;
+      let version;
+      do {
+        // A local change (enroll/delete) while the request was in flight makes
+        // the response stale; fetch again.
+        version = state.speakersVersion;
+        list = await api.listSpeakers();
+      } while (version !== state.speakersVersion);
+      const recovered = !!state.speakersError;
+      state.speakers = list;
+      state.loadedSpeakers = true;
+      state.speakersError = null;
+      speakersLoad.retryDelay = 1000;
+      renderPeople();
+      if (recovered && healthError) loadHealth();
+    } catch (err) {
+      if (state.loadedSpeakers) {
+        console.warn('Could not refresh people:', err.message); // keep the list we have
+      } else {
+        state.speakersError = err.message;
+        speakersLoad.retryTimer = setTimeout(refreshSpeakers, speakersLoad.retryDelay);
+        speakersLoad.retryDelay = Math.min(speakersLoad.retryDelay * 2, SPEAKERS_RETRY_MAX_MS);
+        render();
+      }
+    } finally {
+      speakersLoad.inFlight = null;
+    }
+  })();
+  return speakersLoad.inFlight;
+}
+
+function setSpeakers(list) {
+  state.speakers = list;
+  state.speakersVersion++;
 }
 
 function upsertSpeaker(sp) {
   const i = state.speakers.findIndex((s) => s.id === sp.id);
   if (i >= 0) state.speakers[i] = sp;
   else state.speakers.push(sp);
+  state.speakersVersion++;
   renderPeople();
 }
 
@@ -318,10 +373,10 @@ async function deleteSpeaker(id) {
   await withBusy(async () => {
     try {
       await api.deleteSpeaker(id);
-      state.speakers = state.speakers.filter((s) => s.id !== id);
+      setSpeakers(state.speakers.filter((s) => s.id !== id));
       setEnrollStatus(`Removed ${sp.name}.`);
     } catch (err) {
-      if (err.status === 404) state.speakers = state.speakers.filter((s) => s.id !== id);
+      if (err.status === 404) setSpeakers(state.speakers.filter((s) => s.id !== id));
       else setEnrollError(`Could not remove ${sp.name}: ${err.message}`);
     }
   });
@@ -335,7 +390,7 @@ async function deleteAll() {
   await withBusy(async () => {
     try {
       await api.deleteAllSpeakers();
-      state.speakers = [];
+      setSpeakers([]);
       setEnrollStatus('Removed everyone.');
     } catch (err) {
       setEnrollError(`Could not remove everyone: ${err.message}`);
@@ -348,6 +403,7 @@ async function deleteAll() {
 
 async function startRecording(target) {
   if (state.mode !== 'idle') return;
+  primeAudio(); // must run inside the click, before any await (Safari/iOS)
   setEnrollError('');
   setEnrollStatus('');
   hideBanner();
@@ -427,8 +483,12 @@ async function finishRecording({ deviceLost = false } = {}) {
     }
   } catch (err) {
     setEnrollStatus('');
-    setEnrollError(err.message);
-    if (err.status === 404) refreshSpeakers();
+    if (err.status === 409 && rec.target.kind === 'new') {
+      setEnrollError(`${rec.target.name} is already enrolled. Use “+ sample” next to their name to add more audio.`);
+    } else {
+      setEnrollError(err.message);
+    }
+    if (err.status === 404 || err.status === 409) refreshSpeakers();
   } finally {
     state.mode = 'idle';
     render();
@@ -473,22 +533,34 @@ function clearStopTimer() {
 
 async function startListening() {
   if (state.mode !== 'idle' || !state.speakers.length) return;
+  primeAudio(); // must run inside the click, before any await (Safari/iOS)
   hideBanner();
   state.mode = 'connecting';
+  state.lastServerError = null;
   render();
+
+  // While finishing, any message shows the server is still working: push the
+  // give-up timer back.
+  const heardFromServer = () => {
+    if (state.mode === 'finishing' && state.stopTimer) armStopTimer(session);
+  };
 
   const session = new SessionClient({
     onStatus: (st) => {
       if (session !== state.session) return;
+      heardFromServer();
       if (st === 'stopped' && state.mode === 'finishing') endSession();
     },
     onSpeech: (active) => {
       if (session !== state.session) return;
+      heardFromServer();
+      if (state.mode === 'finishing') return; // keep showing "Processing…"
       el.speech.classList.toggle('active', active);
       el.speechText.textContent = active ? 'Someone is speaking…' : 'Listening…';
     },
     onUtterance: (u) => {
       if (session !== state.session) return;
+      heardFromServer();
       if (u.id != null && state.seenIds.has(u.id)) return;
       if (u.id != null) state.seenIds.add(u.id);
       appendLine({
@@ -506,16 +578,20 @@ async function startListening() {
     },
     onError: (message) => {
       if (session !== state.session) return;
+      heardFromServer();
+      state.lastServerError = message;
       showBanner(`Server error: ${message}`);
     },
     onClose: ({ expected }) => {
       if (session !== state.session || expected) return;
       const wasFinishing = state.mode === 'finishing';
+      const serverError = state.lastServerError;
       endSession({ socketGone: true });
       showBanner(
-        wasFinishing
+        (wasFinishing
           ? 'The connection closed before the last speech was processed.'
-          : 'Connection to the server was lost. Listening stopped.',
+          : 'Connection to the server was lost. Listening stopped.') +
+          (serverError ? ` Server error: ${serverError}` : ''),
       );
     },
   });
@@ -564,7 +640,15 @@ async function startListening() {
   state.sessionCount++;
   if (state.lines.length) {
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    appendLine({ kind: 'separator', label: `New session · ${t}` });
+    const label = `New session · ${t}`;
+    const last = state.lines[state.lines.length - 1];
+    if (last.kind === 'separator') {
+      // The previous session produced nothing: reuse its separator.
+      last.label = label;
+      el.feed.lastElementChild.textContent = label;
+    } else {
+      appendLine({ kind: 'separator', label });
+    }
   }
   state.mode = 'listening';
   el.speech.classList.remove('active');
@@ -578,6 +662,8 @@ async function stopListening() {
   const session = state.session;
   state.mode = 'finishing';
   mic.onended = null;
+  el.speech.classList.remove('active');
+  el.speechText.textContent = 'Processing the last speech…';
   render();
   await mic.stop(); // flushes the final partial chunk through sendAudio
   if (state.session !== session) return; // socket died meanwhile
@@ -585,12 +671,26 @@ async function stopListening() {
     endSession();
     return;
   }
+  state.finishDeadline = performance.now() + STOP_MAX_MS;
+  armStopTimer(session);
+}
+
+/** (Re)start the finishing give-up timer: STOP_IDLE_TIMEOUT_MS of server silence, capped by finishDeadline. */
+function armStopTimer(session) {
+  clearStopTimer();
+  const left = state.finishDeadline - performance.now();
+  const hitCap = left <= STOP_IDLE_TIMEOUT_MS;
   state.stopTimer = setTimeout(() => {
+    state.stopTimer = null;
     if (state.session === session && state.mode === 'finishing') {
-      showBanner('The server did not confirm the end of the session in time; some speech may be missing.');
+      showBanner(
+        hitCap
+          ? `The server was still processing ${Math.round(STOP_MAX_MS / 1000)} s after you stopped; gave up waiting. Some speech may be missing.`
+          : 'The server stopped responding while finishing; some speech may be missing.',
+      );
       endSession();
     }
-  }, STOP_TIMEOUT_MS);
+  }, Math.max(0, Math.min(STOP_IDLE_TIMEOUT_MS, left)));
 }
 
 /** Tear down the session (mic, socket, timers) and go back to idle. */
@@ -631,11 +731,12 @@ function exportFeed() {
   const out = [];
   for (const l of state.lines) {
     if (l.kind === 'separator') {
-      if (out.length) out.push('');
+      if (out.length && out[out.length - 1] !== '') out.push('');
     } else {
       out.push(`[${fmtTime(l.start)}] ${l.speaker_name}: ${l.text}`);
     }
   }
+  while (out.length && out[out.length - 1] === '') out.pop();
   if (!out.length) return;
   const blob = new Blob([out.join('\n') + '\n'], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -652,6 +753,8 @@ function exportFeed() {
 
 // ---------- health ----------
 
+let healthError = null; // banner text shown for a failed health check
+
 async function loadHealth() {
   try {
     const h = await api.getHealth();
@@ -660,8 +763,11 @@ async function loadHealth() {
     if (h.embedder === 'mfcc') note += ' · basic speaker model (install ML extras for better accuracy)';
     if (h.transcriber === 'null') note += ' · no speech-to-text installed (placeholders shown)';
     el.health.textContent = parts.join(' · ') + note;
+    if (healthError && el.bannerText.textContent === healthError) hideBanner();
+    healthError = null;
   } catch (err) {
     el.health.textContent = 'Server unreachable.';
+    healthError = err.message;
     showBanner(err.message);
   }
 }
@@ -695,6 +801,7 @@ el.jump.addEventListener('click', () => {
   state.stickToBottom = true;
   el.jump.hidden = true;
 });
+window.addEventListener('focus', () => refreshSpeakers());
 window.addEventListener('pagehide', () => {
   mic.stop();
   if (state.session) state.session.close();

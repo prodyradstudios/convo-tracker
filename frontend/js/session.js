@@ -1,6 +1,7 @@
 // WebSocket client for /ws/session (see docs/SPEC.md).
 
 const MAX_BUFFERED_BYTES = 256 * 1024; // ~8 s of 16 kHz PCM16; drop audio beyond this
+const CONNECT_TIMEOUT_MS = 10000;
 
 export function sessionUrl() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -25,8 +26,8 @@ export class SessionClient {
     this.droppedChunks = 0;
   }
 
-  /** Open the socket. Resolves when open; rejects if it fails to connect. */
-  connect(url = sessionUrl()) {
+  /** Open the socket. Resolves when open; rejects if it fails (or takes too long) to connect. */
+  connect(url = sessionUrl(), timeoutMs = CONNECT_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
       let opened = false;
       let ws;
@@ -39,7 +40,15 @@ export class SessionClient {
       ws.binaryType = 'arraybuffer';
       this.ws = ws;
 
+      const timer = setTimeout(() => {
+        if (opened) return;
+        reject(new Error('Timed out connecting to the server for live listening.'));
+        this.close();
+      }, timeoutMs);
+
       ws.onopen = () => {
+        clearTimeout(timer);
+        if (this.closing) return; // gave up (timed out or closed) before it opened
         opened = true;
         resolve();
       };
@@ -48,6 +57,7 @@ export class SessionClient {
         // A close event always follows; handled there.
       };
       ws.onclose = (e) => {
+        clearTimeout(timer);
         this.closed = true;
         if (!opened) {
           reject(new Error('Could not connect to the server for live listening.'));
