@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Convo Tracker</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>Convo Tracker</h1>
+    <p class="tagline">Enroll each voice, then see who said what.</p>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden>
+    <span id="banner-text"></span>
+    <button type="button" id="banner-close" class="icon-btn" aria-label="Dismiss message">✕</button>
+  </div>
+
+  <main class="panels">
+    <!-- People -->
+    <section class="panel" aria-labelledby="people-heading">
+      <div class="panel-head">
+        <h2 id="people-heading">People</h2>
+        <button type="button" id="remove-all" class="btn btn-quiet" disabled>Remove all</button>
+      </div>
+
+      <form id="enroll-form" class="enroll" novalidate>
+        <label for="name-input" class="label">Name</label>
+        <div class="enroll-row">
+          <input id="name-input" name="name" type="text" maxlength="40" autocomplete="off"
+                 placeholder="e.g. Alex" aria-describedby="enroll-hint enroll-error" required>
+          <button type="submit" id="record-btn" class="btn btn-primary">Record</button>
+        </div>
+        <div id="enroll-meter" class="meter" aria-hidden="true" hidden><div class="meter-fill"></div></div>
+        <p id="enroll-hint" class="hint">Type a name, press Record and speak naturally for 5–15 seconds.</p>
+        <p id="enroll-error" class="error" role="alert" hidden></p>
+        <p id="enroll-status" class="status" role="status"></p>
+      </form>
+
+      <ul id="people-list" class="people" aria-label="Enrolled people"></ul>
+      <p id="people-empty" class="empty">Nobody enrolled yet.</p>
+    </section>
+
+    <!-- Conversation -->
+    <section class="panel panel-convo" aria-labelledby="convo-heading">
+      <div class="panel-head">
+        <h2 id="convo-heading">Conversation</h2>
+        <div class="toolbar">
+          <button type="button" id="clear-btn" class="btn btn-quiet" disabled>Clear</button>
+          <button type="button" id="export-btn" class="btn btn-quiet" disabled>Export .txt</button>
+        </div>
+      </div>
+
+      <div class="listen-row">
+        <button type="button" id="listen-btn" class="btn btn-primary" disabled aria-describedby="listen-hint">Start listening</button>
+        <div id="speech-indicator" class="speech" hidden>
+          <span class="speech-dot" aria-hidden="true"></span>
+          <span id="speech-text">Listening…</span>
+        </div>
+        <div id="listen-meter" class="meter meter-small" aria-hidden="true" hidden><div class="meter-fill"></div></div>
+      </div>
+      <p id="listen-hint" class="hint">Enroll at least one person to start listening.</p>
+
+      <div class="feed-wrap">
+        <ol id="feed" class="feed" role="log" aria-live="polite" aria-label="Transcript" tabindex="0"></ol>
+        <p id="feed-empty" class="empty feed-empty">The transcript will appear here.</p>
+        <button type="button" id="jump-btn" class="btn jump" hidden>↓ New lines</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <span id="health-text">Connecting to server…</span>
+  </footer>
+</body>
+</html>
