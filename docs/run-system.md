@@ -51,6 +51,59 @@ The extra index on Linux and Windows gets the smaller CPU-only PyTorch. If you o
 
 To update later: `git pull`, then rerun step 4 if `backend/requirements*.txt` changed.
 
+## Windows (PowerShell)
+
+On a Windows laptop, use these PowerShell commands for the whole setup; everything else in this guide is the same. Windows has no `python3.12` or `source` command: use the `py` launcher and the `Activate.ps1` script.
+
+1. Install Python 3.12 and Git (skip what you have). Close and reopen PowerShell afterwards.
+
+```powershell
+winget install Python.Python.3.12
+winget install Git.Git
+```
+
+2. Get the code and create the virtual environment:
+
+```powershell
+git clone https://github.com/prodyradstudios/convo-tracker.git
+cd convo-tracker
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+3. Install the packages (CPU-only PyTorch):
+
+```powershell
+pip install -r backend\requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+4. Start the server, then open http://localhost:8000 in Chrome or Edge:
+
+```powershell
+cd backend
+python -m app
+```
+
+5. Change a setting by setting it first, in the same window:
+
+```powershell
+$env:CT_MATCH_THRESHOLD = "0.25"
+python -m app
+```
+
+The setting lasts until you close that PowerShell window. To run the tests, from the `backend` folder: `pip install -r requirements-dev.txt`, then `python -m pytest -q`.
+
+**Windows-only errors**
+
+| Symptom | Fix |
+| --- | --- |
+| `Activate.ps1 cannot be loaded because running scripts is disabled` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, answer Y, then activate again |
+| `py` or `python` is not recognized | Reopen PowerShell after installing Python; or reinstall from python.org with "Add python.exe to PATH" ticked |
+| `WinError 126` or a missing `.dll` when starting | Install the Visual C++ runtime: `winget install Microsoft.VCRedist.2015+.x64`, then retry |
+| Windows Firewall prompt on first start | Choose **Cancel** or private networks only; the app only needs `localhost` |
+
+Using Command Prompt instead of PowerShell: activate with `.venv\Scripts\activate.bat`, and set a variable with `set CT_MATCH_THRESHOLD=0.25` on its own line before `python -m app`.
+
 ## Run
 
 Start the server from the `backend` folder with the virtual environment active, then use the app at http://localhost:8000.
