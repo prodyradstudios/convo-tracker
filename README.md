@@ -7,6 +7,7 @@ Version 1 enrolls voices first. Each person records a short voice sample and typ
 - **Backend** (`backend/`): Python, FastAPI. A streaming VAD splits the audio into utterances. SpeechBrain ECAPA voiceprints, compared by cosine similarity, identify the speaker, and faster-whisper transcribes the speech.
 - **Frontend** (`frontend/`): plain HTML, CSS and JavaScript, with no build step. Mic audio is captured with an AudioWorklet, resampled to 16 kHz and streamed over a WebSocket.
 - **Contract** (`docs/SPEC.md`): the REST and WebSocket API, audio format and algorithms.
+- **Design guide** (`docs/BUILD_GUIDE.md`): architecture, components, algorithm and roadmap. Start here to iterate on the idea.
 
 ## Quick start
 
