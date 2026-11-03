@@ -4,7 +4,7 @@ import pytest
 from app.audio.vad import Segment
 from app.pipeline import SessionPipeline
 from app.speakers.registry import SpeakerRegistry
-from app.speakers.turns import Turn
+from app.speakers.turns import Turn, TurnAnalysis
 from app.transcription.transcriber import NullTranscriber, build_transcriber
 from conftest import FakeEmbedder, FakeTranscriber, dominant_freq, silence, tone, tone_runs
 
@@ -36,7 +36,7 @@ def test_empty_transcript_skipped_without_consuming_seq():
 def test_null_transcriber():
     t = NullTranscriber()
     assert t.transcribe(np.zeros(24000, np.float32)) == "[speech 1.5s]"
-    assert t.transcribe_words(np.zeros(24000, np.float32)) == []  # no word timing
+    assert t.transcribe_words(np.zeros(24000, np.float32)) is None  # no word timing
     assert build_transcriber("null").name == "null"
 
 
@@ -180,10 +180,11 @@ def test_false_split_is_merged_back(monkeypatch):
     def fake_turns(audio, *args):
         mid = audio.size / 16000 / 2
         alice, bob = (s["id"] for s in reg.list())
-        return [Turn(0.0, mid, alice, 0.9), Turn(mid, audio.size / 16000, bob, 0.9)]
+        turns = [Turn(0.0, mid, alice, 0.9), Turn(mid, audio.size / 16000, bob, 0.9)]
+        return TurnAnalysis(turns, False, None)
 
     p, reg = make()
-    monkeypatch.setattr(pipeline_mod, "detect_turns", fake_turns)
+    monkeypatch.setattr(pipeline_mod, "analyze_turns", fake_turns)
     audio = np.concatenate([silence(0.3), tone(6.0, 200), silence(0.2)])
     [u] = p.process(seg(audio))
     assert (u.speaker_name, u.text) == ("Alice", "tone 200")
@@ -196,10 +197,10 @@ def test_short_piece_keeps_turn_label(monkeypatch):
     def fake_turns(audio, *args):
         alice, bob = (s["id"] for s in reg.list())
         end = audio.size / 16000
-        return [Turn(0.0, 3.3, alice, 0.9), Turn(3.3, end, bob, 0.8)]
+        return TurnAnalysis([Turn(0.0, 3.3, alice, 0.9), Turn(3.3, end, bob, 0.8)], False, None)
 
     p, reg = make(NullTranscriber())
-    monkeypatch.setattr(pipeline_mod, "detect_turns", fake_turns)
+    monkeypatch.setattr(pipeline_mod, "analyze_turns", fake_turns)
     # Bob's piece is 0.8 s (< 1 s): not re-embedded, labelled from its turn.
     audio = np.concatenate([silence(0.3), tone(3.0, 200), tone(0.6, 200), silence(0.2)])
     utts = p.process(seg(audio))
@@ -213,5 +214,192 @@ def test_live_utterances_feed_adaptive_prototypes():
     assert reg.num_adaptive(alice) == 0  # < 2 s of speech
     p.process(seg(np.concatenate([silence(0.3), tone(3.0, 200), silence(0.2)])))
     assert reg.num_adaptive(alice) == 1
-    p.process(seg(interruption()))  # each >= 2 s piece is confident on its own
-    assert (reg.num_adaptive(alice), reg.num_adaptive(bob)) == (2, 1)
+    # Split pieces never adapt (they may hold the boundary mixture of two voices).
+    p.process(seg(interruption()))
+    assert (reg.num_adaptive(alice), reg.num_adaptive(bob)) == (1, 0)
+
+
+# -- regressions (adversarial review of the turn splitter) -------------------------------
+class NoWordsTranscriber:
+    """Whisper-like: hears nothing in the segment; hallucinates on short clips."""
+
+    name = "nowords"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def transcribe_words(self, audio):
+        self.calls.append("words")
+        return []
+
+    def transcribe(self, audio):
+        self.calls.append("text")
+        return "Thank you."
+
+
+def test_no_words_means_nothing_said_not_no_timing():
+    tr = NoWordsTranscriber()
+    p, _ = make(tr)
+    turns = [tone(3.0, 200), tone(3.0, 400), tone(3.0, 200)]
+    audio = np.concatenate([silence(0.3), *turns, silence(0.2)])
+    assert p.process(seg(audio)) == []
+    assert tr.calls == ["words"]  # no per-turn re-transcription
+
+
+def test_transcribers_without_word_timing_still_cut_audio():
+    class OldStyle:  # no transcribe_words at all
+        name = "old"
+
+        def transcribe(self, audio):
+            return f"{audio.size / 16000:.1f}s"
+
+    for tr in (NullTranscriber(), OldStyle()):
+        p, _ = make(tr)
+        utts = p.process(seg(interruption()))
+        assert [u.speaker_name for u in utts] == ["Alice", "Bob"], tr
+
+
+def test_whisper_text_without_words_means_no_timing():
+    import threading
+    from types import SimpleNamespace as NS
+
+    from app.transcription.transcriber import WhisperTranscriber
+
+    class FakeModel:
+        def __init__(self, segments):
+            self.segments = segments
+
+        def transcribe(self, audio, **kwargs):
+            return iter(self.segments), NS(language="en")
+
+    w = WhisperTranscriber.__new__(WhisperTranscriber)
+    w._language, w._lock = "en", threading.Lock()
+    w._model = FakeModel([])
+    assert w.transcribe_words(np.zeros(16000, np.float32)) == []  # heard nothing
+    w._model = FakeModel([NS(text=" Hi.", words=None)])
+    assert w.transcribe_words(np.zeros(16000, np.float32)) is None  # text but no timing
+
+
+class FixedWords:
+    name = "fixed"
+
+    def __init__(self, words):
+        self.words = words
+
+    def transcribe_words(self, audio):
+        return list(self.words)
+
+    def transcribe(self, audio):
+        return "unused"
+
+
+def _check_pieces(utts, segment):
+    for u in utts:
+        assert segment.start <= u.start < u.end <= segment.end, (u.start, u.end)
+    for x, y in zip(utts, utts[1:]):
+        assert x.end <= y.start
+
+
+@pytest.mark.parametrize("order", ["sorted", "reversed", "shuffled"])
+def test_unsorted_and_nan_word_times_give_ordered_valid_pieces(order):
+    from app.transcription.transcriber import Word
+
+    nan = float("nan")
+    words = [Word(f" w{i:02d}", 0.4 + 0.3 * i, 0.6 + 0.3 * i) for i in range(20)]
+    words += [Word(" n1", nan, nan), Word(" n2", 4.4, nan), Word(" z", 1.0, 1.0)]
+    if order == "reversed":
+        words = words[::-1]
+    elif order == "shuffled":
+        words = [words[i] for i in np.random.default_rng(0).permutation(len(words))]
+    p, _ = make(FixedWords(words))
+    segment = seg(interruption())
+    utts = p.process(segment)
+    assert [u.speaker_name for u in utts] == ["Alice", "Bob"]
+    _check_pieces(utts, segment)
+    tokens = [t for u in utts for t in u.text.split()]
+    assert sorted(tokens) == sorted(w.text.strip() for w in words)  # nothing lost
+    timed = [t for t in tokens if t.startswith("w")]
+    assert timed == sorted(timed)  # chronological
+
+
+def test_degenerate_word_times_never_give_empty_spans():
+    from app.transcription.transcriber import Word
+
+    # Every word of Bob's turn is zero-length at the same instant; one Alice word reversed.
+    words = [
+        Word(" a1", 1.0, 2.0), Word(" a2", 3.0, 2.5), Word(" b1", 5.0, 5.0), Word(" b2", 5.0, 5.0)
+    ]
+    p, _ = make(FixedWords(words))
+    segment = seg(interruption())
+    utts = p.process(segment)
+    assert [(u.speaker_name, u.text) for u in utts] == [("Alice", "a1 a2"), ("Bob", "b1 b2")]
+    _check_pieces(utts, segment)
+
+
+def test_words_join_without_inventing_spaces():
+    from app.transcription.transcriber import Word, words_to_text
+
+    assert words_to_text([Word(" Hello", 0, 1), Word(" there.", 1, 2)]) == "Hello there."
+    assert words_to_text([Word("你", 0, 1), Word("好", 1, 2), Word("。", 2, 3)]) == "你好。"
+    assert words_to_text([Word("สวัส", 0, 1), Word("ดี", 1, 2)]) == "สวัสดี"
+    # Transcribers whose words carry no spacing still get spaces between Latin words.
+    assert words_to_text([Word("A1", 0, 1), Word("A2", 1, 2)]) == "A1 A2"
+
+
+def test_cjk_pieces_of_one_speaker_merge_without_spaces(monkeypatch):
+    """Two turns re-identified as the same person: text joins like Whisper's words."""
+    import app.pipeline as pipeline_mod
+    from app.transcription.transcriber import Word
+
+    def fake_turns(audio, *args):
+        alice, bob = (s["id"] for s in reg.list())
+        end = audio.size / 16000
+        return TurnAnalysis([Turn(0.0, 3.3, alice, 0.9), Turn(3.3, end, bob, 0.9)], False, None)
+
+    words = [
+        Word("你", 0.5, 1.5), Word("好", 1.5, 3.0), Word("谢", 3.5, 5.0), Word("谢", 5.0, 6.0)
+    ]
+    p, reg = make(FixedWords(words))
+    monkeypatch.setattr(pipeline_mod, "analyze_turns", fake_turns)
+    audio = np.concatenate([silence(0.3), tone(6.0, 200), silence(0.2)])  # all Alice
+    [u] = p.process(seg(audio))
+    assert u.text == "你好谢谢"
+
+
+def test_no_adaptation_from_split_or_mixed_segments():
+    p, reg = make()
+    alice, bob = (s["id"] for s in reg.list())
+    p.process(seg(interruption(3.0, 3.0)))
+    assert reg.num_adaptive(alice) == reg.num_adaptive(bob) == 0  # split pieces
+    # A blip of Bob smoothed away: one Alice utterance, but not clean evidence.
+    audio = np.concatenate([tone(3.0, 200), tone(0.8, 400), tone(2.7, 200)])
+    [u] = p.process(Segment(audio, 0.0, 6.5, speech_duration=6.5))
+    assert u.speaker_name == "Alice" and reg.num_adaptive(alice) == 0
+    # A clean Alice segment does adapt.
+    p.process(seg(np.concatenate([silence(0.3), tone(6.0, 200), silence(0.2)])))
+    assert reg.num_adaptive(alice) == 1
+
+
+class SpyEmbedder(FakeEmbedder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sizes: list[int] = []
+
+    def embed(self, audio):
+        self.sizes.append(audio.size)
+        return super().embed(audio)
+
+
+def test_single_voice_segment_costs_about_one_segment_of_embedding():
+    fake = SpyEmbedder()
+    reg = SpeakerRegistry(fake.name, fake.default_threshold)
+    reg.enroll("Alice", fake.embed(tone(1.0, 200)))
+    reg.enroll("Bob", fake.embed(tone(1.0, 400)))
+    p = SessionPipeline(fake, FakeTranscriber(), reg)
+    fake.sizes.clear()
+    audio = np.concatenate([silence(0.3), tone(14.5, 200), silence(0.2)])  # 15 s
+    [u] = p.process(seg(audio))
+    assert u.speaker_name == "Alice"
+    # Chunks only: no sliding windows, no extra whole-segment embedding.
+    assert max(fake.sizes) == int(1.5 * 16000)
+    assert sum(fake.sizes) <= audio.size + int(1.5 * 16000)

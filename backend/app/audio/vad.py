@@ -17,13 +17,15 @@ class Segment:
     """A finished utterance. ``start``/``end`` are seconds since the stream start.
 
     ``audio`` (and thus ``duration``) includes the pre-roll and tail padding;
-    ``speech_duration`` is the VAD's onset-to-last-speech-frame time, when known.
+    ``speech_duration`` is the VAD's onset-to-last-speech-frame time, when known;
+    ``noise_floor_db`` is the segmenter's background estimate when it was cut.
     """
 
     audio: np.ndarray
     start: float
     end: float
     speech_duration: float | None = None
+    noise_floor_db: float | None = None
 
     @property
     def duration(self) -> float:
@@ -66,6 +68,13 @@ class VadConfig:
     def frames(self, ms: float) -> int:
         """Number of whole frames covering ``ms`` milliseconds (at least 1)."""
         return max(1, int(round(ms / self.frame_ms)))
+
+
+def speech_threshold_db(config: VadConfig, noise_db: float | None) -> float:
+    """Frame energy above which a frame counts as speech, given the noise floor."""
+    floor = noise_db if noise_db is not None else _MIN_DB
+    floor = min(floor, config.max_noise_db)
+    return max(floor + config.margin_db, config.min_speech_db)
 
 
 def frame_db(frame: np.ndarray) -> float:
@@ -163,9 +172,7 @@ class Segmenter:
         self._silence = 0
 
     def _threshold(self) -> float:
-        floor = self._noise_db if self._noise_db is not None else _MIN_DB
-        floor = min(floor, self.config.max_noise_db)
-        return max(floor + self.config.margin_db, self.config.min_speech_db)
+        return speech_threshold_db(self.config, self._noise_db)
 
     def _update_noise(self, db: float, is_speech: bool) -> None:
         self._seen += 1
@@ -242,6 +249,7 @@ class Segmenter:
             frames = frames[: self._last_speech + 1 + self._tail_frames]
         speech_frames = self._last_speech + 1 - self._onset
         start_frame = self._utt_start
+        noise_db = self._noise_db
         self._reset_utterance()
         if not frames:
             return None
@@ -252,7 +260,11 @@ class Segmenter:
         sr = self.config.sample_rate
         start = start_frame * self._flen / sr
         return Segment(
-            audio=audio, start=start, end=start + audio.size / sr, speech_duration=speech_s
+            audio=audio,
+            start=start,
+            end=start + audio.size / sr,
+            speech_duration=speech_s,
+            noise_floor_db=noise_db,
         )
 
 

@@ -20,7 +20,7 @@ backend/
     speakers/__init__.py
     speakers/embedder.py    # Embedder protocol, EcapaEmbedder (SpeechBrain), MfccEmbedder (numpy-only fallback)
     speakers/registry.py    # SpeakerRegistry: enroll, delete, list, identify (prototype scoring), JSON persistence
-    speakers/turns.py       # detect_turns: speaker-change detection inside one segment (sliding windows)
+    speakers/turns.py       # analyze_turns: speaker-change detection inside one segment (chunk pre-check + sliding windows)
     transcription/__init__.py
     transcription/transcriber.py  # Transcriber protocol, WhisperTranscriber (faster-whisper), NullTranscriber
     pipeline.py             # SessionPipeline: VAD -> turns -> embed -> identify -> transcribe -> Utterances
@@ -121,12 +121,15 @@ Segmenter API: `feed(samples: np.ndarray) -> list[Segment]`, `flush() -> list[Se
   their sample as `augmented`; `num_samples` counts real samples only.
 - **Scoring** against each speaker: `score = max(cos(u, centroid), mean of the top-2 cos(u, p) over the speaker's prototypes)`,
   where prototypes = real sample embeddings + their augmented embeddings + adaptive prototypes. (With one sample and no extras this is
-  plain cosine to the centroid.)
+  plain cosine to the centroid.) The **static** score is the same without adaptive prototypes; adaptive prototypes only count for a
+  speaker whose static score is already >= threshold (they can never turn an Unknown voice into a match).
 - Identify: best score >= threshold (`CT_MATCH_THRESHOLD`, default = embedder.default_threshold) → that speaker, else Unknown.
   `confidence` = that score. Utterances < 1.0 s: still identify, but if best - second_best < 0.05 and there was a previous identified
   speaker within that pair, prefer the previous speaker (continuity smoothing).
-- **Adaptive prototypes** (`CT_ADAPT=1|0`, default 1): a live utterance (or split piece) with >= 2.0 s of speech identified with
-  score >= threshold + 0.15 AND at least 0.10 above the second-best speaker adds its embedding as an adaptive prototype of that speaker.
+- **Adaptive prototypes** (`CT_ADAPT=1|0`, default 1): a live utterance with >= 2.0 s of speech identified with
+  **static** score >= threshold + 0.15 AND at least 0.10 above the second-best speaker's static score (with only one speaker enrolled:
+  static score >= threshold + 0.25), AND cos(embedding, centroid) >= threshold adds its embedding as an adaptive prototype of that speaker.
+  Only whole, unsplit segments whose turn analysis was clean (every chunk/window had the same label) adapt; split pieces never do.
   In memory only (never persisted), FIFO capped at 20 per speaker, thread-safe, dropped when the speaker is deleted (or all are removed).
 - Persistence: `CT_DATA_DIR` (default `./data`), `speakers.json` storing id, name, color, created_at, embedder name, sample embeddings as
   lists and `augmented` (one list of embeddings per sample). Files without `augmented` (older versions) load fine; an entry whose
@@ -138,20 +141,36 @@ Segmenter API: `feed(samples: np.ndarray) -> list[Segment]`, `flush() -> list[Se
 Runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGMENT_S` (default 2.0) when at least 2 speakers are enrolled.
 
 1. Windows of `CT_TURN_WINDOW_S` (default 1.5 s) every `CT_TURN_HOP_S` (default 0.5 s), evenly spread over the segment audio;
-   at most 40 windows (the hop grows if needed). Windows with fewer than 50 % voiced 30 ms frames are skipped (voiced = above
-   `max(-50 dBFS, min(10th-percentile frame energy + 10 dB, loudest frame - 20 dB))`, i.e. the VAD's frame size and margins).
-2. Window embeddings are computed in one batch (`embed_many`) and scored against every speaker with the registry's scoring.
-   Each window gets its best speaker, or Unknown below the threshold.
-3. Smoothing: a window whose two neighbours agree takes their label (majority over 3 windows); then runs shorter than
-   `CT_TURN_MIN_S` (default 1.0 s) are merged, shortest first, into the neighbour whose speaker scores higher on that run's windows
-   (an Unknown neighbour counts as scoring the threshold).
+   at most 40 windows (the hop grows if needed). Windows with fewer than 50 % voiced 30 ms frames are skipped. Voiced uses the VAD's
+   absolute criterion: frame energy > `max(min_speech_db, min(noise floor, -40 dBFS) + margin_db)`, where the noise floor is the
+   segmenter's (carried on the `Segment`) or, if unknown, the segment's 2nd-percentile frame energy. Nothing is relative to the
+   loudest frame, so a speaker much quieter than the other still counts as voiced.
+2. **Chunk pre-check**: first only the windows that tile the segment end to end (about one window apart, so about the segment's
+   length of audio) are embedded, in one batch. If there are >= 2 and every one has the same best speaker by **static** score, at or
+   above the threshold and >= 0.10 above the runner-up, the segment is one turn of that speaker and the normalised mean of the
+   chunk embeddings is used as its whole-segment embedding (no further embedding). Otherwise the remaining windows are embedded
+   (one more batch; chunk embeddings are reused) and scored with the registry's scoring. Each window gets its best speaker, or
+   Unknown below the threshold.
+3. Smoothing: a window whose two neighbours agree takes their label (majority over 3 windows; the first/last window takes the label
+   of its two inner neighbours when they agree). Then, until stable: an Unknown run spanning <= `CT_TURN_WINDOW_S` between two
+   *different* speakers (the boundary mixture) is split at its midpoint between them; otherwise the shortest run spanning
+   <= `CT_TURN_MIN_S` (default 1.0 s) or holding a single window is merged into the neighbour whose speaker scores higher on that
+   run's windows (an Unknown neighbour counts as scoring the threshold).
 4. Turns `(start, end, speaker_id | None)` cover the segment; a boundary lies midway between the centres of the last window of one
-   run and the first window of the next.
+   run and the first window of the next. Where two adjacent turns' median voiced levels differ by >= 10 dB, the boundary moves to
+   the sharpest level step within half a window of it (the louder voice dominates mixed windows).
 
-If there is one turn, the segment is handled as a single utterance (identity from the whole-segment embedding). Otherwise:
-- With word timestamps (`transcribe_words` non-empty): each word goes to the turn containing its midpoint; consecutive words of one
-  turn form a piece whose `start`/`end` snap to its first/last word (plus `segment.start`).
-- Without (empty list, e.g. the null transcriber): the audio is cut at the turn boundaries and each piece is transcribed separately.
+If there is one turn, the segment is handled as a single utterance (identity from the chunk-mean embedding, or a whole-segment
+embedding when turn analysis did not run). Otherwise:
+- `transcribe_words` returns the words with timestamps, `[]` when nothing was said, or `None` when the transcriber has no word
+  timing (the null transcriber; a transcriber without the method counts as `None`; Whisper returns `None` if a segment has text
+  but no words).
+- With words: each word goes to the turn containing its midpoint (words sorted by midpoint; a non-finite time borrows the other
+  end or the previous word's time); consecutive words of one turn form a piece whose `start`/`end` snap to its first/last word,
+  clamped to the clip; overlapping pieces are cut at the turn boundary, and a piece with no length takes its turn's span. Pieces
+  are in time order with `start < end`. Text is the words concatenated as given (Whisper words carry their own leading space; CJK
+  words none). `[]`: no utterance for the segment.
+- With `None`: the audio is cut at the turn boundaries and each piece is transcribed separately.
 - Each piece of >= 1.0 s is re-identified from an embedding of its own audio; shorter pieces keep their turn's label and score.
   Empty-text pieces are dropped, then adjacent pieces with the same speaker (or both Unknown) are merged (confidence = duration-weighted
   mean). If every turn produced text and they all merge into one speaker (a false split), the segment is handled as unsplit.

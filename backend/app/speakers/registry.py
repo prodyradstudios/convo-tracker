@@ -38,9 +38,12 @@ CONTINUITY_MARGIN = 0.05
 # Prototype scoring: mean of the best TOP_K similarities to a speaker's prototypes.
 TOP_K = 2
 # Adaptive prototypes: confident live utterances become extra (in-memory) prototypes.
+# Every gate uses the *static* score (centroid + enrolled/augmented prototypes, no
+# adaptive ones), so adaptive prototypes can never vouch for their own successors.
 ADAPT_MIN_SPEECH_S = 2.0
-ADAPT_SCORE_MARGIN = 0.15  # score must be >= threshold + this
-ADAPT_RIVAL_MARGIN = 0.10  # ... and beat the second-best speaker by this much
+ADAPT_SCORE_MARGIN = 0.15  # static score must be >= threshold + this
+ADAPT_RIVAL_MARGIN = 0.10  # ... and beat the second-best speaker's static score by this much
+ADAPT_SOLO_MARGIN = 0.25  # with nobody else enrolled (no rival): static >= threshold + this
 ADAPT_MAX_PROTOTYPES = 20
 
 
@@ -219,21 +222,33 @@ class SpeakerRegistry:
             return len(self._adaptive.get(speaker_id, ()))
 
     # -- identification -----------------------------------------------------
-    def score(self, embeddings: np.ndarray) -> ScoreTable:
+    def score(self, embeddings: np.ndarray, *, adaptive: bool = True) -> ScoreTable:
         """Score each row of ``embeddings`` against every enrolled speaker.
 
         score = max(cos(u, centroid), mean of the top-2 cos(u, prototype)) where a
         speaker's prototypes are their real sample embeddings, the augmented
-        copies made at enrollment and any adaptive prototypes learnt live.
+        copies made at enrollment and (``adaptive=True``) any adaptive
+        prototypes learnt live. ``adaptive=False`` gives the *static* score.
+
+        Adaptive prototypes only raise a score whose static part already clears
+        the threshold: they sharpen matches backed by enrolled evidence but can
+        never turn an Unknown voice into a match.
         """
         embs = np.atleast_2d(np.asarray(embeddings, dtype=np.float32))
         norms = np.linalg.norm(embs, axis=1, keepdims=True)
         embs = np.divide(embs, norms, out=np.zeros_like(embs), where=norms > 1e-12)
         with self._lock:
             speakers = self._compatible(embs.shape[1])
-            protos = [self._prototypes(s) for s in speakers]
+            extra = [self._adaptive.get(s.id) if adaptive else None for s in speakers]
+            extra = [np.stack(list(q)) if q else None for q in extra]
             threshold = self.threshold
-        cols = [_score_matrix(embs, s.centroid, p) for s, p in zip(speakers, protos)]
+        cols = []
+        for s, ad in zip(speakers, extra):
+            static = _score_matrix(embs, s.centroid, s.prototypes)
+            if ad is not None:
+                boosted = _score_matrix(embs, s.centroid, np.vstack([s.prototypes, ad]))
+                static = np.where(static >= threshold, boosted, static)
+            cols.append(static)
         scores = np.stack(cols, axis=1) if cols else np.zeros((embs.shape[0], 0), np.float32)
         return ScoreTable([s.id for s in speakers], scores, threshold)
 
@@ -249,8 +264,9 @@ class SpeakerRegistry:
 
         For short utterances (< 1 s) where the top two are within 0.05 and the
         previous identified speaker is one of them, the previous speaker wins.
-        With ``adapt=True`` (live utterances) a very confident match of at least
-        2 s of speech also becomes an adaptive prototype of that speaker.
+        With ``adapt=True`` (whole, clean live segments) a very confident match
+        of at least 2 s of speech, judged on static scores (see
+        :meth:`_maybe_adapt`), also becomes an adaptive prototype of that speaker.
         """
         emb = l2_normalize(embedding)
         table = self.score(emb[None, :])
@@ -278,9 +294,8 @@ class SpeakerRegistry:
             best_score, best = scored[1]
         if best_score < self.threshold:
             return Match(None, UNKNOWN_NAME, UNKNOWN_COLOR, round(best_score, 3))
-        if adapt:
-            rival = max((sc for sc, s in scored if s.id != best.id), default=-1.0)
-            self._maybe_adapt(best.id, emb, duration, best_score, best_score - rival)
+        if adapt and self.adapt and duration >= ADAPT_MIN_SPEECH_S:
+            self._maybe_adapt(best, emb)
         return Match(best.id, best.name, best.color, round(best_score, 3))
 
     def match_for(self, speaker_id: str | None, score: float) -> Match:
@@ -291,21 +306,32 @@ class SpeakerRegistry:
                 return Match(None, UNKNOWN_NAME, UNKNOWN_COLOR, round(float(score), 3))
             return Match(rec.id, rec.name, rec.color, round(float(score), 3))
 
-    def _maybe_adapt(
-        self, speaker_id: str, emb: np.ndarray, duration: float, score: float, margin: float
-    ) -> bool:
-        """Add ``emb`` as an adaptive prototype if the match clears the strict bar."""
-        if not (
-            self.adapt
-            and duration >= ADAPT_MIN_SPEECH_S
-            and score >= self.threshold + ADAPT_SCORE_MARGIN
-            and margin >= ADAPT_RIVAL_MARGIN
-        ):
+    def _maybe_adapt(self, best: SpeakerRecord, emb: np.ndarray) -> bool:
+        """Add ``emb`` as an adaptive prototype of ``best`` if it clears the strict bar.
+
+        Judged on static scores only (no adaptive prototypes): static score >=
+        threshold + 0.15 and >= 0.10 above every other speaker's static score
+        (threshold + 0.25 when nobody else is enrolled), and cos to the centroid
+        >= threshold. The caller checks the speech duration.
+        """
+        static = self.score(emb[None, :], adaptive=False)
+        if best.id not in static.speaker_ids:
+            return False
+        col = static.speaker_ids.index(best.id)
+        own = float(static.scores[0, col])
+        rivals = np.delete(static.scores[0], col)
+        if rivals.size:
+            ok = own >= self.threshold + ADAPT_SCORE_MARGIN and (
+                own - float(rivals.max()) >= ADAPT_RIVAL_MARGIN
+            )
+        else:
+            ok = own >= self.threshold + ADAPT_SOLO_MARGIN
+        if not ok or float(emb @ best.centroid) < self.threshold:
             return False
         with self._lock:
-            if speaker_id not in self._speakers:
+            if best.id not in self._speakers:
                 return False  # deleted meanwhile
-            queue = self._adaptive.setdefault(speaker_id, deque(maxlen=ADAPT_MAX_PROTOTYPES))
+            queue = self._adaptive.setdefault(best.id, deque(maxlen=ADAPT_MAX_PROTOTYPES))
             queue.append(emb.astype(np.float32, copy=True))
         return True
 
@@ -316,13 +342,6 @@ class SpeakerRegistry:
             self._warned_dim = True
             log.warning("skipping enrolled speaker(s) whose embedding size differs; re-enroll")
         return speakers
-
-    def _prototypes(self, rec: SpeakerRecord) -> np.ndarray:
-        """Static prototypes plus adaptive ones (call with the lock held)."""
-        adaptive = self._adaptive.get(rec.id)
-        if not adaptive:
-            return rec.prototypes
-        return np.vstack([rec.prototypes, np.stack(list(adaptive))])
 
     # -- internals ----------------------------------------------------------
     def _require(self, speaker_id: str) -> SpeakerRecord:

@@ -18,7 +18,7 @@ The API contract lives in [`../docs/SPEC.md`](../docs/SPEC.md).
 | `audio/vad.py` | Streaming energy VAD / utterance `Segmenter`, `trim_silence`. |
 | `speakers/embedder.py` | `Embedder` protocol, `EcapaEmbedder` (SpeechBrain, lazy, batched), `MfccEmbedder` (numpy/scipy); loudness normalisation; enrollment augmentation (speed/pitch perturbation). |
 | `speakers/registry.py` | Thread-safe `SpeakerRegistry`: prototype scoring (centroid / top-2 prototypes), continuity smoothing, in-memory adaptive prototypes, atomic JSON persistence. |
-| `speakers/turns.py` | `detect_turns`: sliding-window speaker-change detection inside one segment. |
+| `speakers/turns.py` | `analyze_turns` / `detect_turns`: chunk pre-check, then sliding-window speaker-change detection inside one segment. |
 | `transcription/transcriber.py` | `WhisperTranscriber` (faster-whisper, lazy; text or word timestamps) and `NullTranscriber`. |
 | `pipeline.py` | `SessionPipeline`: segment → turns → one `Utterance` per speaker turn. |
 

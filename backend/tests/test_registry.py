@@ -433,3 +433,90 @@ def test_bad_augmented_embeddings_are_dropped_on_enroll(reg):
     # Only (0, 1, 0) survived (normalised): top-2 mean = (0 + 1) / 2.
     assert reg.identify(q, 2.0).confidence == pytest.approx(0.5)
     assert reg.get(a["id"])["num_samples"] == 1
+
+
+# -- adaptation cannot drift (adversarial review) ----------------------------------------
+def _drift_world():
+    """Alice, Bob and a never-enrolled stranger S on orthonormal axes (ECAPA-like 0.30)."""
+    rng = np.random.default_rng(0)
+    q, _ = np.linalg.qr(rng.standard_normal((192, 4)))
+    alice, bob, stranger, _ = q.T
+    reg = SpeakerRegistry("ecapa", 0.30)
+    a = reg.enroll("Alice", alice)["id"]
+    reg.enroll("Bob", bob)
+
+    def mix(c_alice: float, seed: int = 0, noise: float = 0.0) -> np.ndarray:
+        r = np.random.default_rng(seed)
+        v = c_alice * alice + np.sqrt(1 - c_alice**2) * stranger + noise * r.standard_normal(192)
+        return v / np.linalg.norm(v)
+
+    return reg, a, mix
+
+
+def test_stranger_stream_cannot_take_over_an_enrolled_speaker():
+    """A stranger's utterances drift away from Alice a little at a time.
+
+    The first ones are (barely) confident Alice matches. Adaptive prototypes
+    learnt from them must not vouch for the next ones, and must never make the
+    stranger's own voice a match.
+    """
+    reg, a, mix = _drift_world()
+    probe = mix(0.20)
+    assert reg.identify(probe, 3.0).speaker_id is None
+    for k, c in enumerate([0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20] * 3):
+        reg.identify(mix(c, seed=k, noise=0.004), 3.0, adapt=True)
+    assert reg.num_adaptive(a) <= 6  # only the statically confident ones (0.50 / 0.45)
+    m = reg.identify(probe, 3.0)
+    assert m.speaker_id is None and m.confidence == pytest.approx(0.2, abs=0.01)
+    # A long stream of the stranger alone stays Unknown.
+    for k in range(40):
+        assert reg.identify(mix(0.2, seed=100 + k, noise=0.004), 3.0, adapt=True).speaker_id is None
+
+
+def test_adaptation_gates_use_static_scores():
+    reg = SpeakerRegistry("fake", 0.5)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    near = unit(np.cos(np.radians(30)), 0, np.sin(np.radians(30)))  # static 0.866
+    for _ in range(3):
+        reg.identify(near, 3.0, adapt=True)
+    assert reg.num_adaptive(a) == 3
+    # 52 deg from Alice: static 0.616 < 0.65. Adaptive prototypes at 30 deg make the
+    # full score ~0.93, but that must not count for adaptation.
+    far = unit(np.cos(np.radians(52)), 0, np.sin(np.radians(52)))
+    assert reg.identify(far, 3.0).confidence > 0.9
+    reg.identify(far, 3.0, adapt=True)
+    assert reg.num_adaptive(a) == 3
+
+
+def test_adaptive_prototypes_never_lift_a_score_over_the_threshold():
+    reg = SpeakerRegistry("fake", 0.5)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    for _ in range(3):
+        reg.identify(unit(0.8, 0, 0.6), 3.0, adapt=True)  # static 0.8: adapted
+    assert reg.num_adaptive(a) == 3
+    weak = unit(0.4, 0, 0.92)  # static 0.40 (Unknown); ~0.98 to the adaptive prototypes
+    assert reg.identify(weak, 3.0).speaker_id is None
+    assert reg.score(weak[None, :]).scores[0].max() == pytest.approx(0.40, abs=0.01)
+
+
+def test_single_enrolled_speaker_needs_a_wider_margin_to_adapt():
+    reg = SpeakerRegistry("fake", 0.5)
+    a = reg.enroll("Alice", vec(1, 0, 0))["id"]
+    reg.identify(unit(0.7, 0, 0.71), 3.0, adapt=True)  # 0.70 >= thr + 0.15 but < thr + 0.25
+    assert reg.num_adaptive(a) == 0
+    reg.identify(unit(0.8, 0, 0.6), 3.0, adapt=True)  # 0.80 >= thr + 0.25
+    assert reg.num_adaptive(a) == 1
+
+
+def test_adaptation_requires_centroid_similarity():
+    """A match carried by one augmented prototype (centroid far away) is not adapted."""
+    reg = SpeakerRegistry("fake", 0.5)
+    aug = [unit(0, 0, 1), unit(0, 0.05, 1)]  # augmented copies far from the sample
+    a = reg.enroll("Alice", vec(1, 0, 0), augmented=aug)["id"]
+    reg.enroll("Bob", vec(0, 1, 0))
+    u = unit(0.3, 0, 1)  # cos to centroid 0.29; top-2 prototype mean ~0.95
+    m = reg.identify(u, 3.0, adapt=True)
+    assert m.speaker_id == a and m.confidence > 0.9
+    assert reg.num_adaptive(a) == 0
