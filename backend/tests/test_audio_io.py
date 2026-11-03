@@ -79,3 +79,54 @@ def test_pcm16_roundtrip():
     audio = tone(0.1, 1000, amp=0.9)
     back = pcm16_to_float32(float32_to_pcm16(audio))
     assert np.max(np.abs(back - audio)) < 1e-4
+
+
+def _raw_wav_header(sample_rate: int, data: bytes = b"\x00\x10" * 100) -> bytes:
+    """A tiny hand-built 16-bit mono PCM WAV with an arbitrary sample rate."""
+    import struct
+
+    fmt = struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+    return (
+        b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + fmt
+        + b"data" + struct.pack("<I", len(data)) + data
+    )
+
+
+@pytest.mark.parametrize("rate", [1, 3999, 384_001, 2_000_003, 50_000_017])
+def test_absurd_sample_rates_rejected_before_resampling(rate, monkeypatch):
+    import app.audio.io as io_mod
+
+    def boom(*args, **kwargs):  # resampling such rates can take GBs of RAM
+        raise AssertionError("resample_poly must not be called")
+
+    monkeypatch.setattr(io_mod, "resample_poly", boom)
+    wav = _raw_wav_header(rate)
+    with pytest.raises(AudioDecodeError, match="sample rate"):
+        decode_wav(wav)
+    with pytest.raises(AudioDecodeError, match="sample rate"):
+        probe_duration(wav)
+    with pytest.raises(AudioDecodeError, match="sample rate"):
+        to_mono_16k(np.zeros(10, np.float32), rate)
+
+
+@pytest.mark.parametrize("rate", [4000, 8000, 44100, 384_000])
+def test_supported_sample_rates_decode(rate):
+    assert decode_wav(_raw_wav_header(rate)).dtype == np.float32
+
+
+def test_awkward_in_range_rate_resamples_cheaply(monkeypatch):
+    import app.audio.io as io_mod
+
+    seen = []
+    real = io_mod.resample_poly
+
+    def spy(x, up, down):
+        seen.append((up, down))
+        return real(x, up, down)
+
+    monkeypatch.setattr(io_mod, "resample_poly", spy)
+    out = decode_wav(_raw_wav_header(383_983, b"\x00\x10" * 4000))  # prime rate
+    assert max(seen[-1]) <= 1000
+    assert out.size == pytest.approx(4000 * 16000 / 383_983, abs=2)
+    decode_wav(encode_wav(tone(0.1), 44100))
+    assert seen[-1] == (160, 441)  # standard rates stay exact

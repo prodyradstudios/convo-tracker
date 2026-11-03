@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +84,7 @@ class SpeakerRegistry:
         self._lock = threading.RLock()
         self._speakers: dict[str, SpeakerRecord] = {}
         self._foreign: list[dict[str, Any]] = []  # other embedders' records, kept on disk
+        self._warned_dim = False
         if self.path is not None:
             self._load()
 
@@ -106,6 +107,8 @@ class SpeakerRegistry:
             return len(self._speakers)
 
     # -- mutations ----------------------------------------------------------
+    # Each mutation builds the new state, saves it, and only then commits it to
+    # memory, so a failed save leaves memory matching what is on disk.
     def enroll(self, name: str, embedding: np.ndarray) -> dict[str, Any]:
         """Create a speaker from one sample embedding. Raises DuplicateNameError."""
         name = name.strip()
@@ -119,28 +122,25 @@ class SpeakerRegistry:
                 created_at=time.time(),
                 samples=[l2_normalize(embedding)],
             )
-            self._speakers[rec.id] = rec
-            self._save()
+            self._commit({**self._speakers, rec.id: rec}, self._foreign)
             return rec.to_public()
 
     def add_sample(self, speaker_id: str, embedding: np.ndarray) -> dict[str, Any]:
         with self._lock:
             rec = self._require(speaker_id)
-            rec.samples.append(l2_normalize(embedding))
-            self._save()
+            rec = replace(rec, samples=[*rec.samples, l2_normalize(embedding)])
+            self._commit({**self._speakers, rec.id: rec}, self._foreign)
             return rec.to_public()
 
     def delete(self, speaker_id: str) -> None:
         with self._lock:
             self._require(speaker_id)
-            del self._speakers[speaker_id]
-            self._save()
+            speakers = {k: v for k, v in self._speakers.items() if k != speaker_id}
+            self._commit(speakers, self._foreign)
 
     def clear(self) -> None:
         with self._lock:
-            self._speakers.clear()
-            self._foreign.clear()
-            self._save()
+            self._commit({}, [])
 
     # -- identification -----------------------------------------------------
     def identify(
@@ -153,8 +153,12 @@ class SpeakerRegistry:
         """
         emb = l2_normalize(embedding)
         with self._lock:
+            speakers = [s for s in self._speakers.values() if s.samples[0].shape == emb.shape]
+            if len(speakers) < len(self._speakers) and not self._warned_dim:
+                self._warned_dim = True
+                log.warning("skipping enrolled speaker(s) whose embedding size differs; re-enroll")
             scored = sorted(
-                ((float(np.dot(emb, s.centroid)), s) for s in self._speakers.values()),
+                ((float(np.dot(emb, s.centroid)), s) for s in speakers),
                 key=lambda t: t[0],
                 reverse=True,
             )
@@ -186,33 +190,55 @@ class SpeakerRegistry:
         used = [s.color for s in self._speakers.values()]
         return min(PALETTE, key=lambda c: (used.count(c), PALETTE.index(c)))
 
+    def _commit(self, speakers: dict[str, SpeakerRecord], foreign: list[dict[str, Any]]) -> None:
+        """Persist the given state, then make it current (unchanged if saving fails)."""
+        self._save(speakers, foreign)
+        self._speakers, self._foreign = speakers, foreign
+
+    def _move_aside(self, reason: str) -> None:
+        assert self.path is not None
+        backup = self.path.with_suffix(f".corrupt-{int(time.time())}.json")
+        log.error("could not load %s (%s); moved it to %s", self.path, reason, backup)
+        os.replace(self.path, backup)
+
     def _load(self) -> None:
         assert self.path is not None
         if not self.path.exists():
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            entries = data["speakers"]
-        except (OSError, ValueError, KeyError, TypeError):
-            backup = self.path.with_suffix(f".corrupt-{int(time.time())}.json")
-            log.error("could not parse %s; moved it to %s", self.path, backup)
-            os.replace(self.path, backup)
+        except (OSError, ValueError) as exc:
+            self._move_aside(f"invalid JSON: {exc}")
             return
-        dropped = 0
+        entries = data.get("speakers") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            self._move_aside("expected an object with a 'speakers' list")
+            return
+        dropped = skipped = 0
+        dim: int | None = None
         for entry in entries:
+            if not isinstance(entry, dict):
+                skipped += 1
+                continue
             if entry.get("embedder") != self.embedder_name:
                 self._foreign.append(entry)
                 dropped += 1
                 continue
-            rec = SpeakerRecord(
-                id=entry["id"],
-                name=entry["name"],
-                color=entry["color"],
-                created_at=float(entry["created_at"]),
-                samples=[np.asarray(e, dtype=np.float32) for e in entry["samples"]],
-            )
-            if rec.samples:
-                self._speakers[rec.id] = rec
+            try:
+                rec = _parse_record(entry)
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("skipping invalid speaker entry in %s: %s", self.path, exc)
+                skipped += 1
+                continue
+            if dim is None:
+                dim = rec.samples[0].size
+            if rec.samples[0].size != dim or rec.id in self._speakers:
+                log.warning("skipping inconsistent speaker entry %r in %s", rec.name, self.path)
+                skipped += 1
+                continue
+            self._speakers[rec.id] = rec
+        if skipped:
+            log.warning("skipped %d invalid speaker entr(ies) in %s", skipped, self.path)
         if dropped:
             log.warning(
                 "ignoring %d enrolled speaker(s) made with a different embedder than %r; "
@@ -221,8 +247,8 @@ class SpeakerRegistry:
                 self.embedder_name,
             )
 
-    def _save(self) -> None:
-        """Atomically write all speakers to disk (tmp file + os.replace)."""
+    def _save(self, speakers: dict[str, SpeakerRecord], foreign: list[dict[str, Any]]) -> None:
+        """Atomically write ``speakers`` + ``foreign`` to disk (tmp file + os.replace)."""
         if self.path is None:
             return
         entries = [
@@ -234,9 +260,9 @@ class SpeakerRegistry:
                 "embedder": self.embedder_name,
                 "samples": [e.astype(float).round(6).tolist() for e in s.samples],
             }
-            for s in self._speakers.values()
+            for s in speakers.values()
         ]
-        payload = {"version": 1, "speakers": entries + self._foreign}
+        payload = {"version": 1, "speakers": entries + foreign}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".speakers-", suffix=".tmp", dir=self.path.parent)
         try:
@@ -248,3 +274,31 @@ class SpeakerRegistry:
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
+
+
+def _parse_record(entry: dict[str, Any]) -> SpeakerRecord:
+    """Build a record from a stored entry; raises on any malformed field."""
+    samples = [np.asarray(e, dtype=np.float64) for e in entry["samples"]]
+    if not samples:
+        raise ValueError("no samples")
+    shape = samples[0].shape
+    if len(shape) != 1 or shape[0] == 0:
+        raise ValueError("samples must be non-empty 1-D vectors")
+    for e in samples:
+        if e.shape != shape:
+            raise ValueError("samples differ in size")
+        if not np.all(np.abs(e) < 1e30) or not np.any(e):
+            raise ValueError("samples must be finite and non-zero")
+    for key in ("id", "name", "color"):
+        if not isinstance(entry[key], str) or not entry[key]:
+            raise ValueError(f"{key!r} must be a non-empty string")
+    created_at = float(entry["created_at"])
+    if not np.isfinite(created_at):
+        raise ValueError("'created_at' must be finite")
+    return SpeakerRecord(
+        id=entry["id"],
+        name=entry["name"],
+        color=entry["color"],
+        created_at=created_at,
+        samples=[e.astype(np.float32) for e in samples],
+    )

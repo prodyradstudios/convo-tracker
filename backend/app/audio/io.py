@@ -3,17 +3,33 @@
 from __future__ import annotations
 
 import io
-from math import gcd
+from fractions import Fraction
 
 import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
 SAMPLE_RATE = 16_000
+# Accepted input sample rates. Resampling cost grows with the rate's prime
+# factors, so absurd rates in a tiny crafted header could exhaust CPU/RAM.
+MIN_INPUT_RATE = 4_000
+MAX_INPUT_RATE = 384_000
+# Largest up/down factor handed to resample_poly. Standard rates reduce exactly
+# (44.1 kHz -> 160/441, 48 kHz -> 1/3); odd rates get a ratio within ~1e-6.
+_MAX_RESAMPLE_FACTOR = 1000
 
 
 class AudioDecodeError(ValueError):
     """Raised when uploaded audio cannot be decoded."""
+
+
+def check_sample_rate(sample_rate: int) -> None:
+    """Raise AudioDecodeError unless ``sample_rate`` is within the supported range."""
+    if not MIN_INPUT_RATE <= int(sample_rate) <= MAX_INPUT_RATE:
+        raise AudioDecodeError(
+            f"unsupported sample rate {sample_rate} Hz "
+            f"(expected {MIN_INPUT_RATE}-{MAX_INPUT_RATE} Hz)"
+        )
 
 
 def probe_duration(data: bytes) -> float:
@@ -22,17 +38,22 @@ def probe_duration(data: bytes) -> float:
         info = sf.info(io.BytesIO(data))
     except Exception as exc:  # soundfile raises various error types
         raise AudioDecodeError("could not read audio file (expected WAV)") from exc
-    return info.frames / info.samplerate if info.samplerate else 0.0
+    check_sample_rate(info.samplerate)
+    return info.frames / info.samplerate
 
 
 def to_mono_16k(audio: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Downmix a (frames,) or (frames, channels) array to mono and resample to 16 kHz."""
+    """Downmix a (frames,) or (frames, channels) array to mono and resample to 16 kHz.
+
+    Raises AudioDecodeError for sample rates outside MIN_INPUT_RATE..MAX_INPUT_RATE.
+    """
+    check_sample_rate(sample_rate)
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
     if sample_rate != SAMPLE_RATE and audio.size:
-        g = gcd(int(sample_rate), SAMPLE_RATE)
-        audio = resample_poly(audio, SAMPLE_RATE // g, int(sample_rate) // g)
+        ratio = Fraction(SAMPLE_RATE, int(sample_rate)).limit_denominator(_MAX_RESAMPLE_FACTOR)
+        audio = resample_poly(audio, ratio.numerator, ratio.denominator)
     audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
     return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
 
@@ -40,7 +61,10 @@ def to_mono_16k(audio: np.ndarray, sample_rate: int) -> np.ndarray:
 def decode_wav(data: bytes) -> np.ndarray:
     """Decode WAV (or any soundfile-supported) bytes to float32 mono 16 kHz."""
     try:
+        check_sample_rate(sf.info(io.BytesIO(data)).samplerate)  # before reading samples
         audio, sample_rate = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    except AudioDecodeError:
+        raise
     except Exception as exc:
         raise AudioDecodeError("could not decode audio file (expected WAV)") from exc
     return to_mono_16k(audio, sample_rate)

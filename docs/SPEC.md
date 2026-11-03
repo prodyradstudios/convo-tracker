@@ -59,7 +59,7 @@ Backend works internally in float32 in [-1, 1].
 
 `Speaker` = `{"id": str (uuid4 hex), "name": str, "color": str ("#rrggbb"), "num_samples": int, "created_at": float (unix seconds)}`
 
-Errors: `{"detail": str}` with status 400 (bad name, unreadable audio, too short: < 2.0 s of speech after trimming silence), 404 (unknown id), 409 (duplicate name, case-insensitive), 413 (upload > 10 MB or > 60 s).
+Errors: `{"detail": str}` with status 400 (bad name, unreadable audio or sample rate outside 4–384 kHz, too short: < 2.0 s of speech after trimming silence — counted from VAD speech onset to last speech frame, excluding pre-roll/tail padding), 404 (unknown id), 409 (duplicate name, case-insensitive), 413 (upload > 10 MB or > 60 s; a request whose body exceeds 10 MB + 64 KB is refused before it is read).
 
 Colors are assigned server-side from a fixed palette of 8 distinct colors, cycling.
 
@@ -67,6 +67,7 @@ Colors are assigned server-side from a fixed palette of 8 distinct colors, cycli
 
 Client → server:
 - Text frame `{"type":"start"}` — begin a session (resets segmenter). Server replies `{"type":"status","state":"listening"}`.
+  A `start` while already listening ends the current run without a `stopped`: its in-progress utterance is flushed (with `speech` `false` if needed) and its results are sent before the new `listening`.
 - Binary frames — raw PCM16LE 16 kHz mono, any length (browser sends ~100 ms chunks). Ignored unless started. Odd byte counts: drop the trailing byte.
 - Text frame `{"type":"stop"}` — flush any in-progress utterance, finish processing queued ones, then reply `{"type":"status","state":"stopped"}`.
 
@@ -79,6 +80,7 @@ Server → client:
   - `confidence` = best cosine similarity, rounded to 3 decimals.
   - Utterances whose transcript is empty/whitespace are NOT sent.
 - `{"type":"error","message":str}`
+  - If more than 40 utterances are waiting to be processed, the oldest waiting one is dropped and `{"type":"error","message":"Falling behind: dropped an utterance"}` is sent.
 
 Utterances must be emitted in seq order. Heavy work (embedding, transcription) runs off the event loop
 (`asyncio.to_thread` / a single worker per session) so audio reception never blocks.
@@ -87,12 +89,14 @@ Utterances must be emitted in seq order. Heavy work (embedding, transcription) r
 
 Frame = 30 ms (480 samples). Per-frame RMS energy in dBFS. Adaptive noise floor (slow EMA of non-speech frames,
 initialised from the first 300 ms). Speech if energy > max(noise_floor + 10 dB, -50 dBFS).
+If every frame of a 5 s window counts as speech, the floor is raised to that window's quietest frame (the background got louder).
 - Utterance starts after 3 consecutive speech frames; keep 300 ms pre-roll.
 - Utterance ends after `CT_SILENCE_MS` (default 700) ms of non-speech; keep 200 ms tail.
 - Force-cut at `CT_MAX_UTTERANCE_S` (default 15) s.
 - Drop utterances shorter than `CT_MIN_UTTERANCE_S` (default 0.5) s.
 Segmenter API: `feed(samples: np.ndarray) -> list[Segment]`, `flush() -> list[Segment]`, plus events for speech start/end.
-`Segment(audio: np.ndarray, start: float, end: float)`.
+`Segment(audio: np.ndarray, start: float, end: float, speech_duration: float | None = None)`; `speech_duration` is onset → last speech frame
+(no pre-roll/tail) and is what the < 1.0 s continuity-smoothing rule uses.
 
 ## Speaker identification
 

@@ -138,6 +138,67 @@ def test_corrupt_file_is_moved_aside(path):
     assert list(path.parent.glob("speakers.corrupt-*.json"))
 
 
+@pytest.mark.parametrize("content", ['{"speakers": null}', '[]', '{"speakers": "x"}', "null"])
+def test_wrong_top_level_shape_is_moved_aside(path, content):
+    path.parent.mkdir(parents=True)
+    path.write_text(content)
+    assert SpeakerRegistry("fake", 0.5, path).list() == []
+    assert list(path.parent.glob("speakers.corrupt-*.json"))
+
+
+def test_invalid_entries_are_skipped(path, caplog):
+    def entry(id_, samples, **kw):
+        return {"embedder": "fake", "id": id_, "name": id_, "color": "#000000",
+                "created_at": 1.0, "samples": samples, **kw}
+
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"speakers": [
+        "x",
+        {"embedder": "fake", "name": "no id"},
+        entry("ragged", [[1, 2], [1, 2, 3]]),
+        entry("matrix", [[[1, 2]]]),
+        entry("empty", []),
+        entry("nan", [[1e39, 0]]),  # overflows float32 -> inf
+        entry("strs", ["ab"]),
+        entry("badtime", [[1, 0]], created_at="soon"),
+        entry("good", [[1, 0]]),
+        entry("otherdim", [[1, 0, 0]]),
+        entry("good2", [[0, 1]]),
+    ]}))
+    with caplog.at_level("WARNING"):
+        reg = SpeakerRegistry("fake", 0.5, path)
+    assert [s["name"] for s in reg.list()] == ["good", "good2"]
+    assert "invalid" in caplog.text
+    assert reg.identify(vec(1, 0), 2.0).speaker_name == "good"
+    assert reg.identify(vec(1, 0, 0, 0), 2.0).speaker_id is None  # wrong size: no crash
+
+
+def test_failed_save_leaves_memory_unchanged(path, reg, monkeypatch):
+    import app.speakers.registry as registry_mod
+
+    alice = reg.enroll("Alice", vec(1, 0, 0))
+    before = reg.list()
+
+    def broken_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(registry_mod.os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        reg.enroll("Bob", vec(0, 1, 0))
+    with pytest.raises(OSError):
+        reg.add_sample(alice["id"], vec(0, 0, 1))
+    with pytest.raises(OSError):
+        reg.delete(alice["id"])
+    with pytest.raises(OSError):
+        reg.clear()
+    assert reg.list() == before  # memory still matches disk
+    assert reg.identify(vec(1, 0, 0), 2.0).confidence == 1.0  # sample not added
+    assert not list(path.parent.glob("*.tmp"))
+    monkeypatch.undo()
+    assert reg.enroll("Bob", vec(0, 1, 0))["name"] == "Bob"  # retry is not a 409
+    assert SpeakerRegistry("fake", 0.5, path).list() == reg.list()
+
+
 def test_in_memory_registry_has_no_file(tmp_path):
     reg = SpeakerRegistry("fake", 0.5, None)
     reg.enroll("Alice", vec(1, 0))

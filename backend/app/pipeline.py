@@ -64,7 +64,8 @@ class SessionPipeline:
     def process(self, segment: Segment) -> Utterance | None:
         """Identify and transcribe a segment; None if the transcript is empty."""
         embedding = self.embedder.embed(segment.audio)
-        match = self.registry.identify(embedding, segment.duration, self._last_speaker)
+        # Continuity smoothing is about how long the person spoke, not the padded clip.
+        match = self.registry.identify(embedding, segment.speech_seconds, self._last_speaker)
         text = self.transcriber.transcribe(segment.audio).strip()
         if not text:
             return None

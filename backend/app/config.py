@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
+
+MAX_UTTERANCE_LIMIT_S = 300.0
 
 _CHOICES = {
     "embedder": ("auto", "ecapa", "mfcc"),
@@ -51,6 +54,28 @@ class Settings:
             if value not in choices:
                 raise ValueError(f"CT_{attr.upper()} must be one of {choices}, got {value!r}")
             setattr(self, attr, value)
+        self._validate_numbers()
+
+    def _validate_numbers(self) -> None:
+        """Fail at startup (ValueError) on non-finite or out-of-range tunables."""
+
+        def check(env: str, value: float, ok: bool, expected: str) -> None:
+            if not (math.isfinite(value) and ok):
+                raise ValueError(f"{env} must be {expected}, got {value!r}")
+
+        if self.match_threshold is not None:
+            t = self.match_threshold
+            check("CT_MATCH_THRESHOLD", t, -1.0 <= t <= 1.0, "a number in [-1, 1]")
+        check("CT_SILENCE_MS", self.silence_ms, self.silence_ms > 0, "> 0")
+        lo, hi = self.min_utterance_s, self.max_utterance_s
+        check("CT_MIN_UTTERANCE_S", lo, lo >= 0, ">= 0")
+        check(
+            "CT_MAX_UTTERANCE_S",
+            hi,
+            lo < hi <= MAX_UTTERANCE_LIMIT_S,
+            f"> CT_MIN_UTTERANCE_S ({lo}) and <= {MAX_UTTERANCE_LIMIT_S:.0f}",
+        )
+        check("CT_PORT", self.port, 0 <= self.port <= 65535, "a port number (0-65535)")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":

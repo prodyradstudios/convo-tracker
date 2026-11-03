@@ -99,15 +99,77 @@ def test_enroll_too_little_speech(client):
     assert r.status_code == 400
 
 
+def test_enroll_counts_speech_not_padding(client):
+    # 1.55 s of speech + VAD pre-roll/tail padding (0.5 s) is still < 2.0 s of speech.
+    short = encode_wav(np.concatenate([silence(1.0), tone(1.55), silence(1.0)]))
+    r = enroll(client, "Alice", short)
+    assert r.status_code == 400 and "speech" in r.json()["detail"]
+    ok = encode_wav(np.concatenate([silence(1.0), tone(2.2), silence(1.0)]))
+    assert enroll(client, "Alice", ok).status_code == 201
+
+
 def test_enroll_too_large(client):
     r = enroll(client, "Alice", b"\0" * (10 * 1024 * 1024 + 1))
     assert r.status_code == 413
+
+
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_oversized_upload_rejected_before_reading_body(client, declare_length):
+    import asyncio
+
+    chunk, total_chunks = b"\0" * (1024 * 1024), 30
+    head = (
+        b'--xyz\r\nContent-Disposition: form-data; name="audio"; filename="a.wav"\r\n'
+        b"Content-Type: audio/wav\r\n\r\n"
+    )
+
+    async def post(path: str) -> tuple[int, int]:
+        consumed, sent = 0, []
+
+        async def receive():
+            nonlocal consumed
+            consumed += 1
+            body = chunk if consumed > 1 else head  # a valid, never-ending file part
+            return {"type": "http.request", "body": body, "more_body": consumed < total_chunks}
+
+        async def send(message):
+            sent.append(message)
+
+        headers = [(b"content-type", b"multipart/form-data; boundary=xyz")]
+        if declare_length:
+            headers.append((b"content-length", str(len(chunk) * total_chunks).encode()))
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+            "scheme": "http", "path": path, "raw_path": path.encode(), "root_path": "",
+            "query_string": b"", "headers": headers, "client": ("test", 1),
+            "server": ("test", 80), "app": client.app,
+        }
+        await client.app(scope, receive, send)
+        return sent[0]["status"], consumed
+
+    for path in ("/api/speakers", "/api/speakers/abc/samples"):
+        status, consumed = asyncio.run(post(path))
+        assert status == 413
+        # Content-Length: refused up front; chunked: stopped right after ~10 MB.
+        assert consumed <= (0 if declare_length else 12)  # 12 = part header + 11 MB
 
 
 def test_enroll_too_long(client):
     wav = encode_wav(tone(61.0, 200, amp=0.1)[::2], 8000)  # 61 s at 8 kHz (~1 MB)
     r = enroll(client, "Alice", wav)
     assert r.status_code == 413
+
+
+def test_enroll_absurd_sample_rate_is_400(client):
+    import struct
+
+    data = b"\x00\x10" * 100
+    fmt = struct.pack("<IHHIIHH", 16, 1, 1, 2_000_003, 4_000_006, 2, 16)
+    wav = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + fmt + b"data"
+    wav += struct.pack("<I", len(data)) + data
+    r = enroll(client, "Evil", wav)
+    assert r.status_code == 400
+    assert "sample rate" in r.json()["detail"]
 
 
 def test_enroll_44k_stereo(client):

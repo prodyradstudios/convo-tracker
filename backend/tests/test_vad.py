@@ -144,3 +144,20 @@ def test_trim_silence():
     speech = trim_silence(audio)
     assert 2.0 <= speech.size / SR <= 3.2
     assert trim_silence(silence(2.0)).size == 0
+
+
+def test_noise_floor_rises_when_background_noise_jumps_during_speech():
+    rng = np.random.default_rng(1)
+
+    def noise(seconds: float, db: float) -> np.ndarray:
+        return (rng.standard_normal(int(seconds * SR)) * 10 ** (db / 20)).astype(np.float32)
+
+    seg = Segmenter()
+    # The noise jump looks like speech at first, but must not stay "speech" forever.
+    segs = seg.feed(noise(2.0, -70)) + seg.feed(noise(30.0, -45))
+    assert len(segs) <= 1 and all(s.end < 10.0 for s in segs)
+    assert not seg.in_speech
+    assert seg.noise_floor_db == pytest.approx(-45, abs=3)
+    # Real speech on top of the louder background is still detected.
+    segs = seg.feed(np.concatenate([tone(1.5), noise(1.5, -45)]))
+    assert len(segs) == 1 and segs[0].speech_duration == pytest.approx(1.5, abs=0.1)
