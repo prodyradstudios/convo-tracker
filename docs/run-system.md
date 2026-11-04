@@ -53,7 +53,7 @@ To update later: `git pull`, then rerun step 4 if `backend/requirements*.txt` ch
 
 ## Windows (PowerShell)
 
-On a Windows laptop, use these PowerShell commands for the whole setup; everything else in this guide is the same. Windows has no `python3.12` or `source` command: use the `py` launcher and the `Activate.ps1` script.
+On a Windows laptop, use these PowerShell commands for the whole setup; everything else in this guide is the same. They call the environment's own Python (`.venv\Scripts\python.exe`) directly, so they work even when activation is blocked and `pip` or `python` is "not recognized".
 
 1. Install Python 3.12 and Git (skip what you have). Close and reopen PowerShell afterwards.
 
@@ -68,30 +68,32 @@ winget install Git.Git
 git clone https://github.com/prodyradstudios/convo-tracker.git
 cd convo-tracker
 py -3.12 -m venv .venv
-.venv\Scripts\Activate.ps1
+.venv\Scripts\python.exe --version
 ```
 
 3. Install the packages (CPU-only PyTorch):
 
 ```powershell
-pip install -r backend\requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+.venv\Scripts\python.exe -m pip install -r backend\requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 4. Start the server, then open http://localhost:8000 in Chrome or Edge:
 
 ```powershell
 cd backend
-python -m app
+..\.venv\Scripts\python.exe -m app
 ```
 
 5. Change a setting by setting it first, in the same window:
 
 ```powershell
 $env:CT_MATCH_THRESHOLD = "0.25"
-python -m app
+..\.venv\Scripts\python.exe -m app
 ```
 
-The setting lasts until you close that PowerShell window. To run the tests, from the `backend` folder: `pip install -r requirements-dev.txt`, then `python -m pytest -q`.
+The setting lasts until you close that PowerShell window. To run the tests, from the `backend` folder: `..\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt`, then `..\.venv\Scripts\python.exe -m pytest -q`.
+
+To use the short `pip` and `python` commands instead, activate once per window with `.venv\Scripts\Activate.ps1`; your prompt then starts with `(.venv)`. If activation says running scripts is disabled, see the first row below.
 
 **Windows-only errors**
 
