@@ -75,6 +75,7 @@ Client → server:
 Server → client:
 - `{"type":"status","state":"listening"|"stopped"}`
 - `{"type":"speech","active":true|false}` — VAD speech start/end (for a "someone is talking" indicator).
+- `{"type":"speaker","speaker_id":str|null,"speaker_name":str,"color":str,"confidence":float,"start":float}` — live speaker identification or a confirmed change. `start` is the estimated turn boundary in session seconds. The client updates its speaking indicator immediately; this event contains no transcript text and does not consume an utterance sequence number. Final text follows in `utterance` messages after transcription.
 - `{"type":"utterance","id":str,"seq":int,"speaker_id":str|null,"speaker_name":str,"color":str,"text":str,"start":float,"end":float,"confidence":float}`
   - `seq` starts at 1 per session and increases in order. `start`/`end` are seconds since session start.
   - `speaker_id` null and `speaker_name` "Unknown" (color `#888888`) when no enrolled speaker scores >= threshold.
@@ -138,7 +139,37 @@ Segmenter API: `feed(samples: np.ndarray) -> list[Segment]`, `flush() -> list[Se
 
 ## Speaker turns (splitting a segment when the speaker changes without a pause)
 
-Runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGMENT_S` (default 2.0) when at least 2 speakers are enrolled.
+### Online handoff
+
+While audio arrives, a separate short-window detector checks active speech using
+`CT_TURN_CHANGE_WINDOW_S` (default 0.4 s) and `CT_TURN_CHANGE_HOP_S` (0.1 s).
+A switch needs a different confidently enrolled identity (or confidently Unknown),
+a cosine distance of at least `CT_TURN_CHANGE_THRESHOLD` (0.35) from the active
+voice, and sustained evidence for `CT_TURN_CHANGE_CONFIRM_S` (0.2 s, at least two
+probes). `CT_TURN_CHANGE_MARGIN` (0.15) rejects ambiguous identities.
+These controls apply independently of the coarse minimum segment/turn durations.
+
+A cheap MFCC novelty check reduces full-model calls; periodic full-model probes
+prevent the cheap check from indefinitely suppressing a genuine change. Candidate
+changes bypass the cheap gate for confirmation. Short-window evidence never
+adapts speaker voiceprints. Model work runs off the event loop.
+
+Confirmed changes cut the active VAD audio at a refined acoustic boundary without
+waiting for silence or sending a false speech-end event. The old turn is queued
+for transcription and a `speaker` event announces the new live identity. The
+suffix keeps its audio and a handoff marker so previous-speaker continuity cannot
+pull it back into the old speaker. Confirmation and model compute add latency;
+the configured audio windows are not a wall-clock latency guarantee.
+
+### Completed-segment analysis
+
+A bounded confidence-gated short-window pass protects clear brief interruptions
+before the conservative coarse pass below. Strong changes require sustained,
+contiguous evidence and a large embedding distance; they are not erased by the
+coarse minimum-turn smoothing. A single enrolled speaker can transition to Unknown.
+
+The coarse fallback runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGMENT_S`
+(default 2.0) when at least 2 speakers are enrolled.
 
 1. Windows of `CT_TURN_WINDOW_S` (default 1.5 s) every `CT_TURN_HOP_S` (default 0.5 s), evenly spread over the segment audio;
    at most 40 windows (the hop grows if needed). Windows with fewer than 50 % voiced 30 ms frames are skipped. Voiced uses the VAD's
@@ -171,7 +202,7 @@ embedding when turn analysis did not run). Otherwise:
   are in time order with `start < end`. Text is the words concatenated as given (Whisper words carry their own leading space; CJK
   words none). `[]`: no utterance for the segment.
 - With `None`: the audio is cut at the turn boundaries and each piece is transcribed separately.
-- Each piece of >= 1.0 s is re-identified from an embedding of its own audio; shorter pieces keep their turn's label and score.
+- Each piece of >= 1.0 s is re-identified from its turn's acoustic span, without previous-speaker continuity bias; shorter pieces keep their turn's label and score. Word-timestamp spans are clamped to their assigned turn so a mistimed word cannot pull another speaker's audio into re-identification.
   Empty-text pieces are dropped, then adjacent pieces with the same speaker (or both Unknown) are merged (confidence = duration-weighted
   mean). If every turn produced text and they all merge into one speaker (a false split), the segment is handled as unsplit.
 - Each remaining piece is its own utterance with its own `seq`, in time order.

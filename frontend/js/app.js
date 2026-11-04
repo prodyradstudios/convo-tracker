@@ -558,6 +558,13 @@ async function startListening() {
       el.speech.classList.toggle('active', active);
       el.speechText.textContent = active ? 'Someone is speaking…' : 'Listening…';
     },
+    onSpeaker: (speaker) => {
+      if (session !== state.session) return;
+      heardFromServer();
+      if (state.mode === 'finishing') return;
+      el.speech.classList.add('active');
+      el.speechText.textContent = `${String(speaker.speaker_name ?? 'Unknown')} is speaking…`;
+    },
     onUtterance: (u) => {
       if (session !== state.session) return;
       heardFromServer();

@@ -13,6 +13,7 @@ from .audio.io import SAMPLE_RATE
 from .audio.vad import Segment, Segmenter, VadConfig
 from .speakers.embedder import Embedder
 from .speakers.registry import Match, SpeakerRegistry
+from .speakers.streaming import StreamingTurnDetector
 from .speakers.turns import Turn, TurnAnalysis, TurnConfig, analyze_turns
 from .transcription.transcriber import Transcriber, Word, join_text
 
@@ -56,9 +57,9 @@ class _Piece:
 class SessionPipeline:
     """State of one listening session.
 
-    :meth:`feed`/:meth:`flush` are cheap and run on the event loop;
-    :meth:`process` is heavy and must be called from a worker thread, one
-    segment at a time, in order.
+    :meth:`feed` runs online voice-change probes; feed, flush and process
+    belong in worker threads. Feed/flush must be serialized with each other;
+    process must run one segment at a time, in order.
     """
 
     def __init__(
@@ -77,12 +78,54 @@ class SessionPipeline:
         self.turn_config = turn_config or TurnConfig()
         self._seq = 0
         self._last_speaker: str | None = None
+        self._detector = StreamingTurnDetector(embedder, registry, self.turn_config, self.vad_config)
+        self._speaker_events: list[dict[str, Any]] = []
 
     def feed(self, samples: np.ndarray) -> list[Segment]:
-        return self.segmenter.feed(samples)
+        # Keep detection cadence independent of WebSocket packet size.
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+        hop = max(1, int(self.turn_config.change_hop_s * SAMPLE_RATE))
+        completed: list[Segment] = []
+        for offset in range(0, samples.size, hop):
+            segments = self.segmenter.feed(samples[offset:offset + hop])
+            completed.extend(segments)
+            if segments:
+                self._detector.reset()
+            snapshot = self.segmenter.active_segment(max(1.0, 2 * self.turn_config.change_window_s))
+            if snapshot is None:
+                self._detector.reset()
+                continue
+            if not len(self.registry):
+                continue
+            change = self._detector.observe(snapshot)
+            if change is None:
+                continue
+            boundary = change.start
+            if not change.initial:
+                prefix = self.segmenter.split_at(boundary)
+                if prefix is None:
+                    self._detector.reset()
+                    continue
+                completed.append(prefix)
+                boundary = prefix.end
+            match = self.registry.match_for(change.speaker_id, change.score)
+            self._speaker_events.append({
+                "type": "speaker", "speaker_id": match.speaker_id,
+                "speaker_name": match.speaker_name, "color": match.color,
+                "confidence": match.confidence, "start": round(boundary, 3),
+            })
+            # A single oversized input packet must not grow live-status memory.
+            del self._speaker_events[:-32]
+        return completed
 
     def flush(self) -> list[Segment]:
-        return self.segmenter.flush()
+        segments = self.segmenter.flush()
+        self._detector.reset()
+        return segments
+
+    def pop_speaker_events(self) -> list[dict[str, Any]]:
+        events, self._speaker_events = self._speaker_events, []
+        return events
 
     def pop_events(self) -> list[bool]:
         return self.segmenter.pop_events()
@@ -93,6 +136,10 @@ class SessionPipeline:
 
         Empty transcripts produce no utterance (and consume no ``seq``).
         """
+        # A confirmed online handoff is independent evidence: a brief new
+        # speaker must not be pulled back to the previous one by continuity.
+        if segment.speaker_change:
+            self._last_speaker = None
         analysis = self._analyze(segment)
         if analysis is not None and len(analysis.turns) > 1:
             pieces, false_split = self._split(segment, analysis.turns)
@@ -105,12 +152,14 @@ class SessionPipeline:
             return self._whole(segment, analysis.embedding, pieces[0].text, adapt=False)
         embedding = analysis.embedding if analysis is not None else None
         # Adapt only from segments where no window/chunk hinted at a second voice.
-        clean = analysis is None or analysis.clean
+        clean = (analysis is None or analysis.clean) and not segment.speaker_change
         return self._whole(segment, embedding, adapt=clean)
 
     def _analyze(self, segment: Segment) -> TurnAnalysis | None:
-        """Turn analysis, or None when splitting does not apply (short / < 2 enrolled)."""
-        if segment.speech_seconds < self.turn_config.min_segment_s or len(self.registry) < 2:
+        """Permit the fast change scan even below the slower coarse-analysis minimum."""
+        minimum = min(self.turn_config.min_segment_s,
+                      self.turn_config.change_window_s + self.turn_config.change_confirm_s)
+        if segment.speech_seconds < minimum or not len(self.registry):
             return None
         return analyze_turns(
             segment.audio,
@@ -164,15 +213,15 @@ class SessionPipeline:
                 pieces.append(_Piece(t.start, t.end, f" {text}" if text else "", t))
         complete = len(pieces) == len(turns) and all(p.text.strip() for p in pieces)
         pieces = [p for p in pieces if p.text.strip()]
-        previous = self._last_speaker
         for p in pieces:
             if p.duration >= PIECE_REIDENTIFY_S:
-                embedding = self.embedder.embed(_cut(audio, p.start, p.end))
-                p.match = self.registry.identify(embedding, p.duration, previous)
+                # Word timestamps can straddle a speaker boundary. Use only
+                # this turn's audio, and never let the previous speaker bias a
+                # turn which already has independent change-point evidence.
+                embedding = self.embedder.embed(_cut(audio, p.turn.start, p.turn.end))
+                p.match = self.registry.identify(embedding, p.turn.end - p.turn.start)
             else:
                 p.match = self.registry.match_for(p.turn.speaker_id, p.turn.score)
-            if p.match.speaker_id is not None:
-                previous = p.match.speaker_id
         merged = _merge_same_speaker(pieces)
         return merged, complete and len(merged) == 1
 
@@ -249,6 +298,9 @@ def _pieces_from_words(words: list[Word], turns: list[Turn], duration: float) ->
         start, end = min(max(start, 0.0), duration), min(max(end, 0.0), duration)
         mid = (start + end) / 2.0
         turn = next((t for t in turns if mid < t.end), turns[-1])
+        # Keep audio used for a piece inside the detected speaker turn,
+        # even when an ASR word's imprecise timing crosses the cut.
+        start, end = max(start, turn.start), min(end, turn.end)
         if groups and groups[-1][0] is turn:
             g = groups[-1]
             g[1].append(w)

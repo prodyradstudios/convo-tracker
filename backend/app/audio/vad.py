@@ -26,6 +26,7 @@ class Segment:
     end: float
     speech_duration: float | None = None
     noise_floor_db: float | None = None
+    speaker_change: bool = False
 
     @property
     def duration(self) -> float:
@@ -125,6 +126,42 @@ class Segmenter:
     def noise_floor_db(self) -> float | None:
         return self._noise_db
 
+    def active_segment(self, max_duration_s: float | None = None) -> Segment | None:
+        """Owned snapshot of complete active frames; excludes the pending partial frame."""
+        if not self._active or not self._frames:
+            return None
+        skip = 0 if max_duration_s is None else max(
+            0, len(self._frames) - max(1, int(np.ceil(max_duration_s * 1000 / self.config.frame_ms))))
+        audio = np.concatenate(self._frames[skip:])
+        start = (self._utt_start + skip) * self._flen / self.config.sample_rate
+        return Segment(audio, start, start + audio.size / self.config.sample_rate,
+                       max(0, self._last_speech + 1 - self._onset) * self.config.frame_ms / 1000,
+                       self._noise_db, self._speaker_changed)
+
+    def split_at(self, seconds: float) -> Segment | None:
+        """Cut active speech on a frame boundary, retaining its suffix without a silence event.
+
+        Unlike silence filtering, a confirmed speaker boundary preserves brief voiced
+        prefixes. No samples are duplicated or dropped across the boundary.
+        """
+        if not self._active or not self._frames:
+            return None
+        n = int(round(seconds * self.config.sample_rate / self._flen)) - self._utt_start
+        if n <= self._onset or n >= len(self._frames) or n > self._last_speech:
+            return None
+        prefix = self._frames[:n]
+        start = self._utt_start * self._flen / self.config.sample_rate
+        audio = np.concatenate(prefix)
+        segment = Segment(audio, start, start + audio.size / self.config.sample_rate,
+                          (min(self._last_speech + 1, n) - self._onset)
+                          * self.config.frame_ms / 1000, self._noise_db, self._speaker_changed)
+        self._frames = self._frames[n:]
+        self._utt_start += n
+        self._onset = max(0, self._onset - n)
+        self._last_speech -= n
+        self._speaker_changed = True
+        return segment
+
     def pop_events(self) -> list[bool]:
         """Return and clear queued speech start (True) / end (False) events."""
         events, self._events = self._events, []
@@ -165,6 +202,7 @@ class Segmenter:
     # -- internals --------------------------------------------------------
     def _reset_utterance(self) -> None:
         self._active = False
+        self._speaker_changed = False
         self._frames: list[np.ndarray] = []
         self._utt_start = 0  # frame index of the first frame in self._frames
         self._onset = 0  # index (within self._frames) of the first speech frame
@@ -250,12 +288,14 @@ class Segmenter:
         speech_frames = self._last_speech + 1 - self._onset
         start_frame = self._utt_start
         noise_db = self._noise_db
+        speaker_changed = self._speaker_changed
         self._reset_utterance()
         if not frames:
             return None
         audio = np.concatenate(frames)
         speech_s = speech_frames * self.config.frame_ms / 1000.0
-        if speech_s < self.config.min_utterance_s:
+        minimum = min(self.config.min_utterance_s, 0.2) if speaker_changed else self.config.min_utterance_s
+        if speech_s < minimum:
             return None
         sr = self.config.sample_rate
         start = start_frame * self._flen / sr
@@ -265,6 +305,7 @@ class Segmenter:
             end=start + audio.size / sr,
             speech_duration=speech_s,
             noise_floor_db=noise_db,
+            speaker_change=speaker_changed,
         )
 
 

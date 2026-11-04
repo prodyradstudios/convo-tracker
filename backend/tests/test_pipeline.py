@@ -154,16 +154,15 @@ def test_three_turns_in_order():
     assert all(x.end <= y.start + 1e-6 for x, y in zip(utts, utts[1:]))
 
 
-def test_no_split_for_short_segments_or_single_speaker():
+def test_short_segments_and_single_enrollment_still_detect_interruptions():
     p, _ = make()
     short = np.concatenate([silence(0.3), tone(0.8, 200), tone(0.8, 400), silence(0.2)])
-    assert len(p.process(seg(short))) == 1  # < CT_TURN_MIN_SEGMENT_S of speech
+    assert [u.speaker_name for u in p.process(seg(short))] == ["Alice", "Bob"]
     fake = FakeEmbedder()
     reg = SpeakerRegistry(fake.name, fake.default_threshold)
     reg.enroll("Alice", fake.embed(tone(1.0, 200)))
     single = SessionPipeline(fake, FakeTranscriber(), reg)
-    assert len(single.process(seg(interruption()))) == 1  # only one person enrolled
-    assert fake.calls == 2  # enrollment + whole segment: no window embeddings
+    assert [u.speaker_name for u in single.process(seg(interruption()))] == ["Alice", "Unknown"]
 
 
 def test_empty_pieces_are_dropped():
@@ -371,10 +370,11 @@ def test_no_adaptation_from_split_or_mixed_segments():
     alice, bob = (s["id"] for s in reg.list())
     p.process(seg(interruption(3.0, 3.0)))
     assert reg.num_adaptive(alice) == reg.num_adaptive(bob) == 0  # split pieces
-    # A blip of Bob smoothed away: one Alice utterance, but not clean evidence.
+    # A short but confident Bob interruption is retained, never used for adaptation.
     audio = np.concatenate([tone(3.0, 200), tone(0.8, 400), tone(2.7, 200)])
-    [u] = p.process(Segment(audio, 0.0, 6.5, speech_duration=6.5))
-    assert u.speaker_name == "Alice" and reg.num_adaptive(alice) == 0
+    utterances = p.process(Segment(audio, 0.0, 6.5, speech_duration=6.5))
+    assert [u.speaker_name for u in utterances] == ["Alice", "Bob", "Alice"]
+    assert reg.num_adaptive(alice) == reg.num_adaptive(bob) == 0
     # A clean Alice segment does adapt.
     p.process(seg(np.concatenate([silence(0.3), tone(6.0, 200), silence(0.2)])))
     assert reg.num_adaptive(alice) == 1
@@ -390,7 +390,7 @@ class SpyEmbedder(FakeEmbedder):
         return super().embed(audio)
 
 
-def test_single_voice_segment_costs_about_one_segment_of_embedding():
+def test_single_voice_segment_embedding_work_is_bounded():
     fake = SpyEmbedder()
     reg = SpeakerRegistry(fake.name, fake.default_threshold)
     reg.enroll("Alice", fake.embed(tone(1.0, 200)))
@@ -400,6 +400,51 @@ def test_single_voice_segment_costs_about_one_segment_of_embedding():
     audio = np.concatenate([silence(0.3), tone(14.5, 200), silence(0.2)])  # 15 s
     [u] = p.process(seg(audio))
     assert u.speaker_name == "Alice"
-    # Chunks only: no sliding windows, no extra whole-segment embedding.
+    # Bounded short-window scan plus the coarse single-speaker pass.
     assert max(fake.sizes) == int(1.5 * 16000)
-    assert sum(fake.sizes) <= audio.size + int(1.5 * 16000)
+    assert sum(fake.sizes) <= 3 * audio.size
+
+
+def test_word_timestamps_crossing_cut_do_not_reidentify_from_previous_voice(monkeypatch):
+    """A loud old voice inside a mistimed new word must not erase the handoff."""
+    import app.pipeline as pipeline_mod
+    from app.transcription.transcriber import Word
+
+    p, reg = make(FixedWords([Word(' Alice', 0.2, 1.0), Word(' Bob', 0.5, 2.5)]))
+    alice, bob = (s['id'] for s in reg.list())
+    monkeypatch.setattr(
+        pipeline_mod, 'analyze_turns',
+        lambda *args: TurnAnalysis([Turn(0, 1.2, alice, 1), Turn(1.2, 3, bob, 1)], False, None),
+    )
+    audio = np.concatenate([tone(1.2, 200, amp=0.8), tone(1.8, 400, amp=0.1)])
+    utterances = p.process(Segment(audio, 0, 3, speech_duration=3))
+    assert [(u.speaker_name, u.text) for u in utterances] == [('Alice', 'Alice'), ('Bob', 'Bob')]
+    assert utterances[0].end <= 1.2 <= utterances[1].start
+
+
+def test_live_interruption_splits_before_silence_or_stop():
+    p, reg = make()
+    alice, bob = (s['id'] for s in reg.list())
+    source = np.concatenate([silence(0.3), tone(2, 200), tone(2, 400)])
+    segments = p.feed(source)
+    assert segments, 'speaker change must finish Alice without waiting for silence'
+    events = p.pop_speaker_events()
+    assert [e['speaker_id'] for e in events] == [alice, bob]
+    assert events[-1]['start'] == pytest.approx(2.3, abs=0.06)
+    utterances = [u for segment in segments for u in p.process(segment)]
+    assert [(u.speaker_name, u.text) for u in utterances] == [('Alice', 'tone 200')]
+    tail = p.flush()
+    assert segments[-1].end == tail[0].start
+    assert [(u.speaker_name, u.text) for segment in tail for u in p.process(segment)] == [('Bob', 'tone 400')]
+
+
+def test_confirmed_online_boundary_disables_continuity_and_adaptation():
+    emb = AmbiguousEmbedder()
+    reg = SpeakerRegistry(emb.name, emb.default_threshold)
+    alice = reg.enroll('Alice', emb.embed(tone(1, 200)))['id']
+    reg.enroll('Bob', emb.embed(tone(1, 400)))
+    p = SessionPipeline(emb, FakeTranscriber(), reg)
+    p.process(Segment(tone(1.5, 200), 0, 1.5))
+    [utterance] = p.process(Segment(tone(0.7, 300), 1.5, 2.2, speaker_change=True))
+    assert utterance.speaker_name == 'Bob'
+    assert reg.num_adaptive(alice) == 0

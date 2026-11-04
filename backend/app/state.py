@@ -36,6 +36,11 @@ class AppState:
             window_s=s.turn_window_s,
             hop_s=s.turn_hop_s,
             min_turn_s=s.turn_min_s,
+            change_window_s=s.turn_change_window_s,
+            change_hop_s=s.turn_change_hop_s,
+            change_margin=s.turn_change_margin,
+            change_confirm_s=s.turn_change_confirm_s,
+            change_threshold=s.turn_change_threshold,
         )
 
 

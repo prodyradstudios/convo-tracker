@@ -1,9 +1,12 @@
 """Speaker turns inside one VAD segment (change-point detection).
 
 The segmenter only cuts on pauses, so when someone interrupts or replies
-without a pause both voices end up in one segment. :func:`analyze_turns` lays
-a grid of short sliding windows over the segment and first embeds only the
-windows that tile it end to end ("chunks": about the segment's length of audio
+without a pause both voices end up in one segment. :func:`analyze_turns` first
+checks short windows for sustained high-confidence identity changes and large
+cosine-distance jumps. Each pass has a separate ``max_windows`` budget, and
+sparse short windows cannot establish sustained evidence. If no strong change
+is found, the conservative pass first embeds only the windows that tile the
+segment end to end ("chunks": about the segment's length of audio
 in total). If they all confidently agree on one speaker it stops there
 (one turn; the chunks' mean embedding stands for the whole segment).
 Otherwise it embeds the remaining windows, labels each window with its
@@ -43,6 +46,12 @@ class TurnConfig:
     min_turn_s: float = 1.0  # shorter runs are merged into a neighbour
     max_windows: int = 40  # per segment; the hop grows if needed
     min_voiced_fraction: float = 0.5  # windows with fewer voiced frames are skipped
+    # Separate bounded scan for strong, short interruptions.
+    change_window_s: float = 0.4
+    change_hop_s: float = 0.1
+    change_margin: float = 0.15
+    change_confirm_s: float = 0.2
+    change_threshold: float = 0.35  # cosine distance between voices
 
 
 @dataclass(frozen=True)
@@ -136,9 +145,10 @@ def analyze_turns(
 ) -> TurnAnalysis:
     """Turns of ``audio``, whether the segment looked like one clean voice, and its embedding.
 
-    Returns a single turn (speaker None) when there is nothing to split: audio
-    shorter than two windows, fewer than two enrolled speakers or fewer than
-    two voiced windows.
+    Short-window changes are checked before the conservative coarse pass.
+    A registered voice can change to Unknown even with only one enrollment.
+    With no reliable change, short clips return a single unlabelled turn for
+    the pipeline to identify from the whole clip.
     """
     config = config or TurnConfig()
     vad = vad or VadConfig()
@@ -146,12 +156,19 @@ def analyze_turns(
     duration = audio.size / sr
     single = [Turn(0.0, duration, None, 0.0)]
     win, hop = int(config.window_s * sr), max(1, int(config.hop_s * sr))
-    if audio.size < win + hop or len(registry) < 2:
+    if len(registry) < 1:
         return TurnAnalysis(single, True, None)
 
     dbs = frame_dbs(audio, vad)
     voiced = _voiced(dbs, vad, noise_floor_db)
     flen = vad.frame_len
+    fast = _strong_changes(audio, embedder, registry, config, voiced, flen)
+    if fast is not None:
+        turns = refine_by_level(fast.turns, dbs, voiced, vad.frame_ms / 1000.0,
+                                config.change_window_s / 2)
+        return TurnAnalysis(turns, fast.clean, fast.embedding)
+    if audio.size < win + hop or len(registry) < 2:
+        return TurnAnalysis(single, True, None)
     starts = [
         s
         for s in window_starts(audio.size, win, hop, config.max_windows)
@@ -191,6 +208,79 @@ def analyze_turns(
     turns = label_runs(table, centres, duration, config)
     turns = refine_by_level(turns, dbs, voiced, vad.frame_ms / 1000.0, config.window_s / 2)
     return TurnAnalysis(turns, clean, embedding)
+
+
+def _strong_changes(
+    audio: np.ndarray,
+    embedder: Embedder,
+    registry: SpeakerRegistry,
+    config: TurnConfig,
+    voiced: np.ndarray,
+    flen: int,
+) -> TurnAnalysis | None:
+    """Protect sustained, well-separated short turns from coarse smoothing.
+
+    This pass has its own max_windows budget. Require both a confident identity
+    and a large embedding change; boundary mixtures and isolated flips cannot
+    become a new turn. No strong change leaves the coarse analysis unchanged.
+    """
+    sr = SAMPLE_RATE
+    win = max(1, int(config.change_window_s * sr))
+    hop = max(1, int(config.change_hop_s * sr))
+    if audio.size < win + hop:
+        return None
+    starts = [s for s in window_starts(audio.size, win, hop, config.max_windows)
+              if _voiced_fraction(voiced, s, s + win, flen) >= config.min_voiced_fraction]
+    if len(starts) < 2:
+        return None
+    # Sparse observations do not establish a sustained short voice change.
+    # The cap or skipped silence can create gaps; use coarse analysis then.
+    if any(b - a > win for a, b in zip(starts, starts[1:])):
+        return None
+    embs = embed_many(embedder, [audio[s:s + win] for s in starts])
+    table = registry.score(embs, adaptive=False)
+    if not table.speaker_ids:
+        return None
+    centres = [(s + win / 2) / sr for s in starts]
+    spacing = min(config.change_hop_s, config.change_window_s)
+    # -1 is inconclusive; None is a confidently unenrolled voice. A gap below
+    # threshold keeps ordinary boundary mixtures from becoming Unknown turns.
+    labels: list[int | None] = []
+    for row in table.scores:
+        order = np.argsort(row)
+        best = int(order[-1])
+        runner = float(row[order[-2]]) if len(order) > 1 else -1.0
+        if row[best] >= table.threshold and row[best] - runner >= config.change_margin:
+            labels.append(best)
+        elif row[best] < table.threshold - config.change_margin:
+            labels.append(None)
+        else:
+            labels.append(-1)
+    accepted: list[tuple[int | None, list[int]]] = []
+    for label, indices in _runs(labels):
+        if label == -1 or len(indices) < 2:
+            continue
+        evidence = centres[indices[-1]] - centres[indices[0]] + spacing
+        if evidence + _EPS < config.change_confirm_s:
+            continue
+        if accepted and accepted[-1][0] == label:
+            accepted[-1][1].extend(indices)
+            continue
+        if accepted:
+            previous = l2_normalize(embs[accepted[-1][1]].mean(axis=0))
+            candidate = l2_normalize(embs[indices].mean(axis=0))
+            if 1.0 - float(np.dot(previous, candidate)) < config.change_threshold:
+                continue
+        accepted.append((label, list(indices)))
+    if len(accepted) < 2:
+        return None
+    spans = _spans(accepted, centres, audio.size / sr)
+    turns = []
+    for (label, indices), (start, end) in zip(accepted, spans):
+        score = float(table.scores[indices].max(axis=1).mean()) if label is None else float(
+            table.scores[indices, label].mean())
+        turns.append(Turn(start, end, table.speaker_ids[label] if label is not None else None, score))
+    return TurnAnalysis(turns, False, l2_normalize(embs.mean(axis=0)))
 
 
 def refine_by_level(
