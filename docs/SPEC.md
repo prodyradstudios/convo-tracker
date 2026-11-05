@@ -24,9 +24,9 @@ backend/
     transcription/__init__.py
     transcription/transcriber.py  # Transcriber protocol, WhisperTranscriber (faster-whisper), NullTranscriber
     pipeline.py             # SessionPipeline: VAD -> turns -> embed -> identify -> transcribe -> Utterances
-  tests/                    # pytest; must run with NO ML packages installed (use mfcc + null/fake transcriber)
+  tests/                    # pytest; no model downloads required (use mfcc + null/fake transcriber)
   requirements.txt          # core: fastapi, uvicorn[standard], numpy, scipy, soundfile, python-multipart
-  requirements-ml.txt       # -r requirements.txt + faster-whisper, speechbrain, torch, torchaudio
+  requirements-ml.txt       # -r requirements.txt + speechbrain, torch, torchaudio
   requirements-dev.txt      # -r requirements.txt + pytest, httpx
   pyproject.toml            # pytest config (testpaths, pythonpath)
 frontend/
@@ -63,6 +63,15 @@ Backend works internally in float32 in [-1, 1].
 Errors: `{"detail": str}` with status 400 (bad name, unreadable audio or sample rate outside 4–384 kHz, too short: < 2.0 s of speech after trimming silence — counted from VAD speech onset to last speech frame, excluding pre-roll/tail padding), 404 (unknown id), 409 (duplicate name, case-insensitive), 413 (upload > 10 MB or > 60 s; a request whose body exceeds 10 MB + 64 KB is refused before it is read).
 
 Colors are assigned server-side from a fixed palette of 8 distinct colors, cycling.
+
+Speech-to-text is included in the standard runtime dependencies. `CT_TRANSCRIBER=auto`
+and `whisper` both load faster-whisper; missing packages, inaccessible model
+downloads, and model-load errors fail startup with an actionable error. They do
+not silently fall back to duration text. Only explicit `CT_TRANSCRIBER=null`
+selects the development placeholder, with a terminal warning and UI banner.
+`CT_WHISPER_MODEL` defaults to `base.en` and also accepts a downloaded model
+directory for offline operation. Tests inject fake models and require no model
+downloads.
 
 ## WebSocket `/ws/session`
 

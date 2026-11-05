@@ -47,7 +47,7 @@ On Windows, activate with `.venv\Scripts\activate` instead. Your prompt should n
 | macOS | `pip install -r backend/requirements-ml.txt` |
 | Linux / Windows | `pip install -r backend/requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu` |
 
-The extra index on Linux and Windows gets the smaller CPU-only PyTorch. If you only want to try the interface without the AI models, install `backend/requirements.txt` instead; speaker matching will be weak and transcripts will be placeholders.
+The extra index on Linux and Windows gets the smaller CPU-only PyTorch. For a smaller install with real transcription, install `backend/requirements.txt` instead; it uses Whisper for words and the basic MFCC speaker matcher. Speech-duration placeholders require explicitly setting `CT_TRANSCRIBER=null` and are intended only for interface development.
 
 To update later: `git pull`, then rerun step 4 if `backend/requirements*.txt` changed.
 
@@ -118,7 +118,7 @@ python -m app
 
 2. Wait for `Uvicorn running on http://127.0.0.1:8000`. The first start downloads the Whisper `base.en` and ECAPA models (a few hundred MB), so it can take a few minutes. Later starts take seconds.
 3. Open **http://localhost:8000** in Chrome and allow the microphone. Use `localhost` exactly: browsers block the mic on other plain-http addresses.
-4. Check the footer. It should name `ecapa` and `whisper`. If it says `mfcc` or `null`, the AI packages are missing; see Troubleshooting.
+4. Check the footer. It should name `ecapa` (or `mfcc` for the basic speaker matcher) and `whisper`. If it says `null`, transcription was explicitly disabled; remove `CT_TRANSCRIBER=null` or set it to `whisper`, then restart. Model load failures now stop startup rather than silently substituting speech durations.
 5. **Enroll** each person in the People panel: type a name, press **Record**, talk normally for about 8 seconds, press **Stop**. Add 2 to 3 samples per person with **+ sample**: one normal, one louder or more animated, one quieter.
 6. **Listen**: press **Start listening** and talk. Each line appears with the speaker's name a second or two after they pause, and interruptions become separate lines.
 7. Press **Stop listening** when done. **Export** downloads the transcript as a `.txt` file.
@@ -163,7 +163,9 @@ Most problems come from the wrong Python version, the wrong folder, or an inacti
 | `pkg-config is required for building PyAV` | Python too new or too old for the prebuilt packages | Delete `.venv` and recreate it with `python3.12`, then reinstall |
 | `No module named 'uvicorn'` | The install failed or the venv isn't active | Activate the venv (`(.venv)` in the prompt) and rerun the install |
 | `Could not open requirements file: backend/requirements-ml.txt` | You are already inside `backend` | Drop the `backend/` prefix, or `cd ..` first |
-| Footer says `mfcc` / `null` | AI packages missing, or models couldn't download; the app fell back to weak stand-ins | Read the warning in the terminal; rerun the install, or fix the network and restart |
+| Footer says `mfcc` | Basic speaker matcher is active; real transcription still works | Install ECAPA extras if better speaker recognition is needed |
+| Footer says `null`, or lines show `[speech …s]` | `CT_TRANSCRIBER=null` explicitly disables transcription | Remove that setting or use `CT_TRANSCRIBER=whisper`, then restart |
+| Startup says Whisper cannot load | Missing runtime, blocked model download, or incompatible device | Install `backend/requirements.txt`, allow Hugging Face model downloads, use `CT_DEVICE=cpu`, or point `CT_WHISPER_MODEL` at a downloaded model directory |
 | Terminal warning mentioning `huggingface.co` | No internet on first start, or a proxy blocks it | Connect and restart; later starts work offline |
 | Mic blocked or no prompt | Page not opened on `localhost`, or permission denied earlier | Use http://localhost:8000; reset site permissions in the browser |
 | `Address already in use` | Another server is on port 8000 | Stop it, or start with `CT_PORT=8001 python -m app` |

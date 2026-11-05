@@ -768,10 +768,13 @@ async function loadHealth() {
     const parts = [`Speaker model: ${h.embedder}`, `Transcriber: ${h.transcriber}`];
     let note = '';
     if (h.embedder === 'mfcc') note += ' · basic speaker model (install ML extras for better accuracy)';
-    if (h.transcriber === 'null') note += ' · no speech-to-text installed (placeholders shown)';
+    if (h.transcriber === 'null') note += ' · speech-to-text disabled (durations only)';
     el.health.textContent = parts.join(' · ') + note;
     if (healthError && el.bannerText.textContent === healthError) hideBanner();
     healthError = null;
+    if (h.transcriber === 'null' && el.banner.hidden) {
+      showBanner('Speech-to-text is disabled. Restart the server with CT_TRANSCRIBER=whisper to transcribe spoken words.');
+    }
   } catch (err) {
     el.health.textContent = 'Server unreachable.';
     healthError = err.message;

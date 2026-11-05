@@ -26,13 +26,17 @@ The API contract lives in [`../docs/SPEC.md`](../docs/SPEC.md).
 
 ```bash
 python3 -m venv ../.venv
-../.venv/bin/pip install -r requirements-dev.txt          # core + tests (no ML)
-# optional, real models (CPU wheels):
+../.venv/bin/pip install -r requirements-dev.txt          # real transcription + tests
+# optional, stronger ECAPA speaker recognition (CPU wheels):
 ../.venv/bin/pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-Without the ML extras the server still starts (auto mode) using the weak
-MFCC embedder and placeholder transcripts (`[speech 2.3s]`), logging a warning.
+Without the ECAPA extras the server uses the basic MFCC speaker matcher and
+real Whisper transcripts. `auto` and `whisper` both load real speech-to-text;
+missing packages or unavailable models stop startup with an actionable error.
+Only explicit `CT_TRANSCRIBER=null` emits `[speech 2.3s]` placeholders, with a
+warning in the terminal and UI. Remove that override or set it to `whisper`
+to restore spoken words.
 Models (ECAPA, Whisper) are downloaded on first start; ECAPA is cached under
 `$CT_DATA_DIR/models`, Whisper in the Hugging Face cache.
 
@@ -54,12 +58,12 @@ Open http://127.0.0.1:8000 (the browser only allows the microphone on
 |---|---|---|
 | `CT_DATA_DIR` | `./data` | Where `speakers.json` (and the ECAPA model) are stored. |
 | `CT_EMBEDDER` | `auto` | `auto` \| `ecapa` \| `mfcc` (auto → ecapa if importable). |
-| `CT_TRANSCRIBER` | `auto` | `auto` \| `whisper` \| `null`. |
+| `CT_TRANSCRIBER` | `auto` | `auto` / `whisper`: real speech-to-text, required to load successfully. `null`: explicit development placeholders only. |
 | `CT_MATCH_THRESHOLD` | embedder default (ecapa 0.30, mfcc 0.80) | Minimum cosine similarity to label a speaker. |
 | `CT_SILENCE_MS` | `700` | Silence that ends an utterance. |
 | `CT_MAX_UTTERANCE_S` | `15` | Force-cut long utterances. |
 | `CT_MIN_UTTERANCE_S` | `0.5` | Drop utterances with less speech than this. |
-| `CT_WHISPER_MODEL` | `base.en` | faster-whisper model name. |
+| `CT_WHISPER_MODEL` | `base.en` | faster-whisper model name or a downloaded model directory (offline). |
 | `CT_DEVICE` | `cpu` | `cpu` or `cuda` (int8 on CPU, float16 otherwise). |
 | `CT_TURN_MIN_SEGMENT_S` | `2.0` | Look for speaker changes only in segments with at least this much speech (>= 0). |
 | `CT_TURN_WINDOW_S` | `1.5` | Window length for speaker-change detection (0.25–10 s). |
@@ -95,6 +99,6 @@ cd backend
 ../.venv/bin/python -m pytest -q
 ```
 
-Tests need only `requirements-dev.txt`; they use fake/MFCC embedders and
+Tests need only `requirements-dev.txt` and do not download models; they use fake/MFCC embedders and
 fake/null transcribers, synthetic audio, and FastAPI's `TestClient`
 (REST and WebSocket).

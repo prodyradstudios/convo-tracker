@@ -74,7 +74,7 @@ def words_to_text(words: Iterable[Word]) -> str:
 
 
 class NullTranscriber:
-    """Placeholder used when faster-whisper is unavailable (and in tests)."""
+    """Explicit development/test placeholder; never selected as a fallback."""
 
     name = "null"
 
@@ -139,16 +139,28 @@ def _whisper_available() -> bool:
 
 
 def build_transcriber(kind: str, model: str = "base.en", device: str = "cpu") -> Transcriber:
-    """Create the transcriber selected by ``CT_TRANSCRIBER`` (auto|whisper|null)."""
+    """Load real speech-to-text unless placeholder mode was explicitly requested.
+
+    Missing packages or model download/load failures must stop startup instead
+    of making a working conversation tracker silently emit speech durations.
+    """
     if kind == "null":
+        log.warning("Speech-to-text is disabled by CT_TRANSCRIBER=null; only speech durations will be shown")
         return NullTranscriber()
-    if kind == "whisper":
-        return WhisperTranscriber(model, device)
+    if kind not in ("auto", "whisper"):
+        raise ValueError(f"Unknown transcriber {kind!r}; choose auto, whisper, or null")
     if not _whisper_available():
-        log.warning("faster-whisper not installed; transcripts will be placeholders")
-        return NullTranscriber()
+        raise RuntimeError(
+            "Speech-to-text requires faster-whisper. Install the runtime dependencies "
+            "with 'python -m pip install -r backend/requirements.txt' from the repository root. "
+            "CT_TRANSCRIBER=null is only for explicit development/testing without transcription."
+        )
     try:
         return WhisperTranscriber(model, device)
-    except Exception:
-        log.warning("could not load Whisper model; using null transcriber", exc_info=True)
-        return NullTranscriber()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load Whisper speech-to-text model {model!r} on {device!r}. "
+            "Check model download access to Hugging Face (or use a downloaded model "
+            "directory in CT_WHISPER_MODEL) and the CT_DEVICE setting. "
+            "Transcription has not been replaced with speech-duration placeholders."
+        ) from exc

@@ -31,7 +31,9 @@ On Linux or Windows, add `--extra-index-url https://download.pytorch.org/whl/cpu
 
 If the install fails with `pkg-config is required for building PyAV`, your Python is too new or too old for the prebuilt packages. Delete `.venv` and recreate it with Python 3.12.
 
-The first start downloads the Whisper (`base.en`) and ECAPA models from Hugging Face. If those packages aren't installed, run `pip install -r backend/requirements.txt` instead. The app then falls back to a weak MFCC speaker matcher and placeholder transcripts, which is useful for development only.
+The first start downloads the Whisper (`base.en`) and ECAPA models from Hugging Face. For a smaller install, `pip install -r backend/requirements.txt` includes real Whisper transcription with the basic MFCC speaker matcher; ECAPA is optional. `CT_TRANSCRIBER=auto` (the default) and `whisper` both require real speech-to-text. If dependencies or model downloads fail, startup reports the error instead of silently replacing words with `[speech …s]`.
+
+If you see only speech durations, remove `CT_TRANSCRIBER=null` from your startup settings or start with `CT_TRANSCRIBER=whisper python -m app` from `backend/`. The explicit `null` mode is only for interface development and tests. Model files are cached after the first successful download; `CT_WHISPER_MODEL` can also point to a downloaded faster-whisper model directory for offline use.
 
 See [`backend/README.md`](backend/README.md) for configuration (`CT_*` environment variables) and tests.
 
