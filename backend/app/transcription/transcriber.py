@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import threading
 import unicodedata
 from dataclasses import dataclass
@@ -118,8 +119,10 @@ class WhisperTranscriber:
     def transcribe_words(self, audio: np.ndarray) -> list[Word] | None:
         """Words with timestamps; ``[]`` if Whisper heard nothing.
 
-        None (no timing) if a segment has text but no words, so the caller
-        falls back to cutting the audio rather than losing that text.
+        None (no usable timing) when recognized text has missing or malformed
+        word data, so the caller transcribes each speaker's audio rather than
+        dropping text or assigning it using invalid boundaries. Inference
+        failures still propagate to the caller.
         """
         words: list[Word] = []
         for seg in self._segments(audio, word_timestamps=True):
@@ -128,9 +131,27 @@ class WhisperTranscriber:
                 if (getattr(seg, "text", "") or "").strip():
                     return None
                 continue
+            segment_words: list[Word] = []
             for w in seg_words:
-                if w.word.strip():
-                    words.append(Word(w.word, float(w.start), float(w.end)))
+                text = getattr(w, "word", None)
+                if not isinstance(text, str):
+                    return None
+                if not text.strip():
+                    if (getattr(seg, "text", "") or "").strip():
+                        return None
+                    continue
+                try:
+                    start = float(getattr(w, "start", None))
+                    end = float(getattr(w, "end", None))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if not (math.isfinite(start) and math.isfinite(end) and start <= end):
+                    return None
+                segment_words.append(Word(text, start, end))
+            # Preserve recognized segment text if a word iterator yielded nothing.
+            if not segment_words and (getattr(seg, "text", "") or "").strip():
+                return None
+            words.extend(segment_words)
         return words
 
 

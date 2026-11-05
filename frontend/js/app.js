@@ -14,6 +14,8 @@ const STOP_MAX_MS = 120000;
 const SPEAKERS_RETRY_MAX_MS = 15000;
 const SAMPLE_RATE = 16000;
 const UNKNOWN_COLOR = '#888888';
+const TRANSCRIPTION_DISABLED_MESSAGE =
+  'Speech-to-text is disabled. Restart the server with CT_TRANSCRIBER=whisper to transcribe spoken words.';
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -772,8 +774,11 @@ async function loadHealth() {
     el.health.textContent = parts.join(' · ') + note;
     if (healthError && el.bannerText.textContent === healthError) hideBanner();
     healthError = null;
+    if (h.transcriber !== 'null' && el.bannerText.textContent === TRANSCRIPTION_DISABLED_MESSAGE) {
+      hideBanner();
+    }
     if (h.transcriber === 'null' && el.banner.hidden) {
-      showBanner('Speech-to-text is disabled. Restart the server with CT_TRANSCRIBER=whisper to transcribe spoken words.');
+      showBanner(TRANSCRIPTION_DISABLED_MESSAGE);
     }
   } catch (err) {
     el.health.textContent = 'Server unreachable.';

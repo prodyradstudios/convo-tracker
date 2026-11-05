@@ -203,8 +203,8 @@ The coarse fallback runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGME
 If there is one turn, the segment is handled as a single utterance (identity from the chunk-mean embedding, or a whole-segment
 embedding when turn analysis did not run). Otherwise:
 - `transcribe_words` returns the words with timestamps, `[]` when nothing was said, or `None` when the transcriber has no word
-  timing (the null transcriber; a transcriber without the method counts as `None`; Whisper returns `None` if a segment has text
-  but no words).
+  timing (the null transcriber; a transcriber without the method counts as `None`; Whisper returns `None` if recognized text has
+  no usable word metadata, including missing, invalid or reversed timestamps). This uses per-turn audio transcription rather than dropping recognized speech.
 - With words: each word goes to the turn containing its midpoint (words sorted by midpoint; a non-finite time borrows the other
   end or the previous word's time); consecutive words of one turn form a piece whose `start`/`end` snap to its first/last word,
   clamped to the clip; overlapping pieces are cut at the turn boundary, and a piece with no length takes its turn's span. Pieces
