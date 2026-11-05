@@ -10,7 +10,7 @@ Convo Tracker turns a live conversation into a transcript where every line is la
 
 1. **Enroll.** For each person: type a name, press Record, speak for about 8 seconds, press Stop. The server turns the clip into a voiceprint (a speaker embedding) and stores it.
 2. **Listen.** Press Start. The browser streams microphone audio to the Python server over a WebSocket.
-3. **Segment.** The server splits the stream into utterances wherever there is a pause.
+3. **Segment.** The server splits the stream at pauses and confirmed speaker changes, including interruptions without a pause.
 4. **Identify and transcribe.** Each utterance is checked for a change of speaker, gets a voiceprint compared against every enrolled person, and a speech-to-text transcript; a change of speaker without a pause becomes separate lines.
 5. **Display.** The browser appends `Name: text` to the conversation feed, in order.
 
@@ -37,8 +37,8 @@ flowchart LR
     subgraph Server["Python server (FastAPI)"]
         REST["REST /api/speakers<br/><small>enroll, add sample, delete</small>"]
         Registry["Speaker registry<br/><small>voiceprints, speakers.json</small>"]
-        WS["WebSocket /ws/session<br/><small>receive loop, never blocks</small>"]
-        VAD["Segmenter (VAD)<br/><small>cuts on 700 ms pauses</small>"]
+        WS["WebSocket /ws/session<br/><small>receive loop + ordered worker</small>"]
+        VAD["VAD + online speaker detector<br/><small>pauses or confirmed voice changes</small>"]
         subgraph Worker["Worker thread, one per connection"]
             Embed["Embed voice<br/><small>ECAPA-TDNN</small>"]
             Identify["Identify<br/><small>vs. registry</small>"]
@@ -51,11 +51,11 @@ flowchart LR
     STT -- "labeled line as JSON over the WebSocket" --> Feed
 ```
 
-The receive loop only buffers audio and finds pauses; the slow steps (voiceprint, matching, Whisper) run in a worker thread so lines come back in order without dropping audio.
+The receive loop feeds VAD and online speaker-change detection through `asyncio.to_thread`, then queues completed turns to an ordered transcript worker. A confirmed incoming speaker can be announced before the previous turn finishes transcription. The transcript queue is bounded; overload drops its oldest waiting utterance and reports an error.
 
 ## Tech stack
 
-The backend is Python with FastAPI; the frontend is plain HTML, CSS and JavaScript with no build step. Heavy ML packages are optional so the app and its tests still run on a bare machine.
+The backend is Python with FastAPI; the frontend is plain HTML, CSS and JavaScript with no build step. Standard dependencies include faster-whisper for real speech-to-text. SpeechBrain and PyTorch are optional for stronger speaker recognition; tests use fake models and do not download model files.
 
 | Layer | Component | Why |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ The backend is Python with FastAPI; the frontend is plain HTML, CSS and JavaScri
 | Speaker voiceprints | SpeechBrain ECAPA-TDNN (`speechbrain/spkrec-ecapa-voxceleb`, 192-dim) | Strong open speaker-verification model, runs on CPU, no API key |
 | Fallback voiceprints | MFCC statistics embedder (NumPy + SciPy) | Works with no PyTorch; used for tests and offline demos |
 | Speech-to-text | faster-whisper, model `base.en`, int8 on CPU | Whisper accuracy at roughly 4x the speed of the reference implementation |
-| Fallback STT | Null transcriber | Emits `[speech 2.3s]` placeholders so the pipeline runs without Whisper |
+| Explicit test/development STT | Null transcriber | Only `CT_TRANSCRIBER=null` emits `[speech 2.3s]` placeholders; never an automatic fallback |
 | Voice activity detection | Custom streaming energy VAD (NumPy), 30 ms frames | No extra dependency; adaptive noise floor; tunable pause length |
 | Audio decoding | soundfile + `scipy.signal.resample_poly` | Reads any WAV, downmixes and resamples to 16 kHz |
 | Storage | In-memory registry + `data/speakers.json` | Enough for one room; atomic writes survive restarts |
@@ -71,7 +71,7 @@ The backend is Python with FastAPI; the frontend is plain HTML, CSS and JavaScri
 | Frontend UI | Vanilla ES modules, CSS | Keeps v1 simple; no framework or bundler |
 | Tests | pytest, httpx `TestClient`, Playwright (Chromium) | Unit, API and WebSocket tests; headless browser smoke test with a fake mic |
 
-Install tiers: `requirements.txt` (core), `requirements-ml.txt` (adds faster-whisper, SpeechBrain, CPU PyTorch), `requirements-dev.txt` (adds pytest, httpx).
+Install tiers: `backend/requirements.txt` (standard runtime, including faster-whisper and PyAV), `backend/requirements-ml.txt` (adds SpeechBrain, PyTorch and torchaudio), `backend/requirements-dev.txt` (standard runtime plus pytest and httpx). `auto` and `whisper` both require real transcription to load successfully; missing dependencies or model-download failures stop startup with an actionable error. Only explicit `CT_TRANSCRIBER=null` permits placeholders, with a terminal warning and UI notice.
 
 ## Frontend components
 
@@ -82,14 +82,14 @@ The page has two panels: **People** (enroll voices) and **Conversation** (live l
 | Enrollment form | `index.html`, `js/app.js` | Name input + Record button. Record turns into "Stop (0:07)" with a timer and level meter. Stop unlocks after 3 s; auto-stops at 15 s. Errors show inline. |
 | People list | `js/app.js` | Color dot, name, sample count, "+ sample" (record another clip for better accuracy), delete, Remove all. |
 | Listen controls | `js/app.js` | Start / Stop listening. Disabled until at least one person is enrolled. Stop shows "Finishing…" until the server confirms all lines are out. |
-| Speaking indicator | `js/app.js` | Lights up while the server's VAD hears speech. |
+| Speaking indicator | `js/app.js` | Lights up while VAD hears speech and shows the speaker name when a live `speaker` event arrives. |
 | Conversation feed | `js/app.js` | One line per utterance: colored name chip, text, mm:ss time, confidence on hover. Unknown lines are muted. Auto-scrolls unless you scrolled up. `aria-live="polite"`. |
 | Clear / Export | `js/app.js` | Clear the feed; download a `.txt` of `[mm:ss] Name: text` lines. |
-| Mic capture | `js/audio.js` | `MicCapture` class: one shared AudioContext, `getUserMedia` with echo cancellation and noise suppression, clean teardown, friendly permission errors. |
+| Audio capture | `js/audio.js` | `AudioCapture` class: microphone via `getUserMedia`, or shared computer audio via `getDisplayMedia`; both use the same AudioWorklet. The common Audio input selector applies to enrollment and live transcription. Only audio is sent; microphone audio is not mixed into computer capture. `MicCapture` remains a compatibility alias. |
 | PCM worklet | `js/pcm-worklet.js` | AudioWorkletProcessor: downmix to mono, resample to 16 kHz without drift between blocks, convert to Int16, post 100 ms chunks (1,600 samples) plus an RMS level. |
 | WAV encoder | `js/wav.js` | Wraps recorded Int16 chunks in a 44-byte RIFF header for upload. |
 | REST client | `js/api.js` | `fetch` wrappers; surfaces the server's `detail` message on errors. |
-| Session socket | `js/session.js` | WebSocket client for `/ws/session`: start, stream binary audio, stop, dispatch status / speech / utterance / error events. |
+| Session socket | `js/session.js` | WebSocket client for `/ws/session`: start, stream binary audio, stop, dispatch status / speech / speaker / utterance / error events. |
 
 Rules that keep it safe and simple: server or user text is rendered with `textContent` only (no `innerHTML`), enrollment recording and live listening are mutually exclusive, and the mic only works on `https` or `localhost`.
 
@@ -112,15 +112,15 @@ The backend is a small FastAPI package, `backend/app`, with one module per job. 
 | `transcription/transcriber.py` | `WhisperTranscriber`, `NullTranscriber` | Audio to text |
 | `pipeline.py` | `SessionPipeline` | Glues it together: segment, split into speaker turns, embed, identify, transcribe, emit one `Utterance` per turn |
 
-**Concurrency.** The WebSocket receive loop only buffers audio and runs the cheap VAD. Embedding and transcription run in a worker thread (`asyncio.to_thread`) fed by an `asyncio.Queue`, one worker per connection, so lines come out in order and incoming audio is never dropped while Whisper is busy.
+**Concurrency.** The WebSocket receive loop awaits serialized feed/flush operations through `asyncio.to_thread`; these run VAD and online voice-change probes off the event loop. A separate worker per connection processes completed segments in order through `asyncio.to_thread`, so transcription does not hold up live speaker events. Its bounded deque preserves status markers; overload drops the oldest waiting audio segment and reports an error.
 
 **Configuration** (environment variables)
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CT_EMBEDDER` | `auto` | `ecapa`, `mfcc`, or `auto` (ECAPA if installed) |
-| `CT_TRANSCRIBER` | `auto` | `whisper`, `null`, or `auto` |
-| `CT_WHISPER_MODEL` | `base.en` | Any faster-whisper model name |
+| `CT_TRANSCRIBER` | `auto` | `auto` and `whisper` require real STT; `null` explicitly enables development placeholders |
+| `CT_WHISPER_MODEL` | `base.en` | faster-whisper model name or a downloaded model directory for offline use |
 | `CT_DEVICE` | `cpu` | `cpu` or `cuda` |
 | `CT_MATCH_THRESHOLD` | embedder default (ECAPA 0.30) | Minimum cosine similarity to name a speaker |
 | `CT_SILENCE_MS` | `700` | Pause that ends an utterance |
@@ -219,7 +219,7 @@ The code lives in `prodyradstudios/convo-tracker`. One command starts the server
 ```
 backend/
   app/            FastAPI package (modules in Backend components)
-  tests/          pytest suite, runs without any ML packages
+  tests/          pytest suite, fake models and no model downloads
   requirements.txt, requirements-ml.txt, requirements-dev.txt
 frontend/
   index.html, styles.css
@@ -231,11 +231,11 @@ docs/BUILD_GUIDE.md this guide
 **Run locally**
 
 1. `python -m venv .venv && source .venv/bin/activate`
-2. `pip install -r backend/requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu`
+2. `pip install -r backend/requirements.txt` (real Whisper transcription and basic MFCC speaker matching)
 3. `cd backend && python -m app`
 4. Open `http://localhost:8000`, enroll each person, press Start listening.
 
-First start downloads the Whisper and ECAPA models (a few hundred MB) from Hugging Face.
+First start downloads Whisper `base.en` from Hugging Face. For stronger speaker recognition, also install `backend/requirements-ml.txt` with `--extra-index-url https://download.pytorch.org/whl/cpu` on Linux/Windows; ECAPA downloads its model on first start. Model access must work before startup can succeed. A downloaded faster-whisper model directory can be selected through `CT_WHISPER_MODEL`. Remove any `CT_TRANSCRIBER=null` startup override to restore spoken words.
 
 **Testing**
 
@@ -253,11 +253,11 @@ V1 handles people taking turns, including interruptions without a pause. The big
 **Known limitations**
 
 - **Overlap**: when two people talk at the same time, the voices are not separated; each 1.5 s window goes to whichever voice dominates it, and the words are attributed to that speaker.
-- **Very quick exchanges**: a reply shorter than about 1 s with no pause before or after it is usually absorbed into the surrounding speaker's line (that is the price of not splitting on noise). Turn boundaries are accurate to roughly a quarter of a second before snapping to word timestamps.
+- **Very quick exchanges**: the rapid detector preserves short, confidently different turns, using 400 ms windows, 100 ms probe hops and 200 ms of confirming evidence by default. Weak or shorter evidence can still be smoothed away. These audio evidence settings are not a wall-clock latency guarantee; model inference adds time.
 - **Short replies**: one-word utterances carry little voice information, so they are the most likely to be mislabeled.
 - **Large voice changes**: augmentation covers about ±2 semitones and loudness; shouting, whispering or a cold can still push a voice beyond that. Adding a sample in that voice helps; adaptive prototypes help during a session but are forgotten on restart.
 - **Room acoustics**: a far-away or echoey mic lowers similarity scores. Enroll in the same room and mic setup you will record in.
-- **CPU latency**: Whisper `base.en` on a laptop CPU takes roughly 0.3 to 1 s per utterance; `small.en` is more accurate but slower. Turn detection costs about one embedding of the segment when one person spoke (chunk pre-check), and one batched pass of about 40 short windows when the speaker changes; word timestamps add a little Whisper time when a segment has several speakers.
+- **CPU latency**: Whisper speed depends on the machine and utterance length; `small.en` is more accurate but slower than `base.en`. Online detection uses cheap acoustic checks plus periodic model probes. Offline analysis has separately bounded short-window and coarse passes; word timestamps add transcription work when a segment has several speakers.
 - **Single room**: speakers are global to the server; there are no accounts or separate rooms.
 
 **Roadmap**

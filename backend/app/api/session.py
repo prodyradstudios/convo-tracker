@@ -145,7 +145,7 @@ class SessionHandler:
         self._enqueue(_Stopped())
 
     async def _end_pipeline(self, pipeline: SessionPipeline) -> None:
-        for segment in pipeline.flush():
+        for segment in await asyncio.to_thread(pipeline.flush):
             await self._enqueue_work(_Work(pipeline, segment))
         await self._send_events(pipeline)
 
@@ -153,7 +153,7 @@ class SessionHandler:
         pipeline = self.pipeline
         if pipeline is None:
             return  # not started: ignore
-        segments = pipeline.feed(pcm16_to_float32(data))
+        segments = await asyncio.to_thread(pipeline.feed, pcm16_to_float32(data))
         await self._send_events(pipeline)
         for segment in segments:
             await self._enqueue_work(_Work(pipeline, segment))
@@ -164,6 +164,14 @@ class SessionHandler:
         async with self._send_lock:
             for active in pipeline.pop_events():
                 await self._send_unlocked({"type": "speech", "active": active})
+            await self._send_speaker_events_unlocked(pipeline)
+
+    async def _send_speaker_events_unlocked(self, pipeline: SessionPipeline) -> None:
+        # Identity events describe who is speaking now. A buffered packet can
+        # contain an entire conversation and its ending silence.
+        events = pipeline.pop_speaker_events()
+        if pipeline.segmenter.in_speech and events:
+            await self._send_unlocked(events[-1])
 
     # -- queue ----------------------------------------------------------------
     def _enqueue(self, item: _Item) -> None:
@@ -202,6 +210,7 @@ class SessionHandler:
                     self._live = item.pipeline
                     for active in item.pipeline.pop_events():
                         await self._send_unlocked({"type": "speech", "active": active})
+                    await self._send_speaker_events_unlocked(item.pipeline)
             elif isinstance(item, _Stopped):
                 await self._send({"type": "status", "state": "stopped"})
             else:

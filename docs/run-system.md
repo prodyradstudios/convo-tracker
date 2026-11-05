@@ -4,16 +4,66 @@
 
 Install once, then start the server and open http://localhost:8000.
 
+## Update an existing installation
+
+Restarting the server does not download changes from GitHub. If a new feature
+is missing, update your existing checkout before following **Run**. Do not clone
+another copy over your current installation.
+
+1. Stop the running server with **Ctrl+C**. Open a terminal in your existing
+   `convo-tracker` repository root (the folder containing `frontend` and `backend`).
+2. Check the checkout and update `main`:
+
+```bash
+git rev-parse --show-toplevel
+git status --short --branch
+git switch main
+git pull --ff-only origin main
+git log -1 --oneline
+git grep -n audio-source HEAD -- frontend/index.html
+```
+
+The last command should show the Audio input selector in the committed HTML.
+If switching or pulling fails because of local changes or diverging branches,
+keep those changes and inspect the error; do not reset or delete the checkout.
+The old `claude/keen-cannon-sxbxab` branch is no longer the installation target.
+
+3. Activate your existing `.venv` as described below and refresh dependencies:
+
+```bash
+python -m pip install -r backend/requirements.txt
+```
+
+If using ECAPA, refresh `backend/requirements-ml.txt` with the platform-specific
+command from **Install** instead. Your voice samples remain in `backend/data`.
+4. Follow **Run** from this same checkout, then hard-refresh the browser with
+   **Ctrl+Shift+R** (Windows/Linux) or **Cmd+Shift+R** (Mac).
+
+If Audio input is still missing, run this with the virtual environment active
+from the `backend` directory:
+
+```bash
+python -c "from app.main import FRONTEND_DIR; print(FRONTEND_DIR)"
+python -c "from urllib.request import urlopen; print('audio-source' in urlopen('http://127.0.0.1:8000/').read().decode())"
+```
+
+The first command identifies this checkout's frontend directory. The second
+checks the HTML actually served on port 8000: `False` means it is serving an
+older frontend, possibly from another checkout or an old server process. If it
+is `True`, check that the browser uses this same address and hard-refresh it.
+If the new server reports that port 8000 is already in use, it did not replace
+the old server; stop the old process in its terminal before restarting.
+
 ## Requirements
 
-You need Python 3.11 to 3.13 (3.12 recommended), git, a Chromium-based browser and a microphone. Newer or older Pythons may lack prebuilt packages, and the install then fails trying to compile them.
+You need Python 3.11 to 3.13 (3.12 recommended), git, a Chromium-based browser, and a microphone or a shareable computer-audio source. Newer or older Pythons may lack prebuilt packages, and the install then fails trying to compile them.
 
 | Item | Requirement | Check |
 | --- | --- | --- |
 | Python | 3.11, 3.12 or 3.13 | `python3 --version` |
 | OS | macOS (Apple Silicon or Intel), Linux, or Windows | none |
 | Browser | Chrome or Edge (Safari and Firefox untested) | none |
-| Microphone | Any; the browser asks for permission | none |
+| Audio input | Microphone, or browser-shared tab/system audio; support depends on browser and OS | Choose **Audio input** in the app |
 | Disk | About 3 GB for PyTorch and models | none |
 | Network | Internet on first start, to download the models from Hugging Face | none |
 
@@ -30,7 +80,7 @@ git clone https://github.com/prodyradstudios/convo-tracker.git
 cd convo-tracker
 ```
 
-2. Until PR #1 is merged, switch to the work branch: `git checkout claude/keen-cannon-sxbxab`. After the merge, stay on `main`.
+2. Use the current `main` branch: `git switch main`.
 3. Create and activate a virtual environment with Python 3.12:
 
 ```bash
@@ -47,9 +97,9 @@ On Windows, activate with `.venv\Scripts\activate` instead. Your prompt should n
 | macOS | `pip install -r backend/requirements-ml.txt` |
 | Linux / Windows | `pip install -r backend/requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu` |
 
-The extra index on Linux and Windows gets the smaller CPU-only PyTorch. If you only want to try the interface without the AI models, install `backend/requirements.txt` instead; speaker matching will be weak and transcripts will be placeholders.
+The extra index on Linux and Windows gets the smaller CPU-only PyTorch. For a smaller install with real transcription, install `backend/requirements.txt` instead; it uses Whisper for words and the basic MFCC speaker matcher. Speech-duration placeholders require explicitly setting `CT_TRANSCRIBER=null` and are intended only for interface development.
 
-To update later: `git pull`, then rerun step 4 if `backend/requirements*.txt` changed.
+To update later, follow **Update an existing installation** above.
 
 ## Windows (PowerShell)
 
@@ -108,7 +158,7 @@ Using Command Prompt instead of PowerShell: activate with `.venv\Scripts\activat
 
 ## Run
 
-Start the server from the `backend` folder with the virtual environment active, then use the app at http://localhost:8000.
+Start the server from the `backend` folder with the virtual environment active, then use the app at http://localhost:8000. To receive new features, complete **Update an existing installation** first; these startup commands do not update the code.
 
 1. Start the server:
 
@@ -119,13 +169,28 @@ python -m app
 ```
 
 2. Wait for `Uvicorn running on http://127.0.0.1:8000`. The first start downloads the Whisper `base.en` and ECAPA models (a few hundred MB), so it can take a few minutes. Later starts take seconds.
-3. Open **http://localhost:8000** in Chrome and allow the microphone. Use `localhost` exactly: browsers block the mic on other plain-http addresses.
-4. Check the footer. It should name `ecapa` and `whisper`. If it says `mfcc` or `null`, the AI packages are missing; see Troubleshooting.
-5. **Enroll** each person in the People panel: type a name, press **Record**, talk normally for about 8 seconds, press **Stop**. Add 2 to 3 samples per person with **+ sample**: one normal, one louder or more animated, one quieter.
-6. **Listen**: press **Start listening** and talk. Each line appears with the speaker's name a second or two after they pause, and interruptions become separate lines.
+3. Open **http://localhost:8000** in Chrome or Edge. Choose **Microphone** or **Computer audio** under **Audio input**; this applies to both enrollment and listening. Allow microphone access or choose an audio-capable share when prompted. Audio capture needs `localhost` or HTTPS.
+4. Check the footer. It should name `ecapa` (or `mfcc` for the basic speaker matcher) and `whisper`. If it says `null`, transcription was explicitly disabled; remove `CT_TRANSCRIBER=null` or set it to `whisper`, then restart. Model load failures now stop startup rather than silently substituting speech durations.
+5. **Enroll** each person in the People panel: type a name, press **Record**, capture that person speaking alone for about 8 seconds, press **Stop**. Use the source where that person is heard; remote people should be enrolled from shared computer audio. Add 2 to 3 samples per person with **+ sample**: one normal, one louder or more animated, one quieter.
+6. **Listen**: press **Start listening** and begin the conversation. Computer-audio mode opens the sharing chooser again; reselect the desired source and enable audio. Each line appears with the speaker's name a second or two after they pause, and interruptions become separate lines.
 7. Press **Stop listening** when done. **Export** downloads the transcript as a `.txt` file.
 
 To stop the server, press **Ctrl+C** in the terminal. Enrolled voices are saved in `backend/data/speakers.json` and come back on the next start; **Remove all** in the People panel deletes them.
+
+## Capture Discord or other computer audio
+
+**Audio input** selects one source for both the People enrollment recorder and live listening. **Microphone** records your local microphone. **Computer audio** records only the audio supplied by the browser sharing chooser; it does not add your microphone.
+
+1. Open Discord in a browser tab when possible. Select **Computer audio** in Convo Tracker.
+2. Enroll each remote speaker separately: enter their name, press **Record**, choose the Discord tab in the sharing dialog, and enable **Share audio**. Have only that person speak for about 8 seconds, then stop. Repeat for the next person. Use the same audio source for enrollment and the conversation.
+3. Press **Start listening**, choose the Discord tab again, and enable **Share audio**. A fresh selection is required for every enrollment sample and every listening session; browser sharing permission is not saved by the app.
+4. Press **Stop listening** to finish, or stop sharing with the browser controls. Starting again opens a new chooser.
+
+For **native Discord** or other desktop apps, the browser may offer **Entire screen** with system audio. Use it only when the chooser offers an audio-sharing option for your browser and OS. Sharing a window or screen does not guarantee an audio track. If native-app/system audio is unavailable, run Discord in a browser tab and share that tab's audio. Browser and operating-system capture capabilities vary; no universal native-app support is assumed.
+
+The browser requires selecting a video surface (tab/window/screen) as part of its display-sharing permission, even though Convo Tracker processes and sends only audio. The local microphone is not mixed into Computer audio, so your own voice will not be transcribed unless the shared source already contains it. During enrollment, everyone except the named speaker must stay quiet.
+
+If the selected share has no audio track, the app shows an error rather than starting silent capture. Retry with an audio-capable tab or system-audio source and enable **Share audio**. Unsupported browsers show an explanatory error. Computer-audio capture uses the existing browser audio processing and backend API; no new Python packages, browser extension, Discord bot, or application dependency is needed.
 
 ## Configuration
 
@@ -162,11 +227,17 @@ Most problems come from the wrong Python version, the wrong folder, or an inacti
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| Audio input / Computer audio selector is missing | An older checkout or cached frontend is being served | Follow **Update an existing installation**, verify `git grep` and the served-HTML check, then hard-refresh the browser |
 | `pkg-config is required for building PyAV` | Python too new or too old for the prebuilt packages | Delete `.venv` and recreate it with `python3.12`, then reinstall |
 | `No module named 'uvicorn'` | The install failed or the venv isn't active | Activate the venv (`(.venv)` in the prompt) and rerun the install |
 | `Could not open requirements file: backend/requirements-ml.txt` | You are already inside `backend` | Drop the `backend/` prefix, or `cd ..` first |
-| Footer says `mfcc` / `null` | AI packages missing, or models couldn't download; the app fell back to weak stand-ins | Read the warning in the terminal; rerun the install, or fix the network and restart |
+| Footer says `mfcc` | Basic speaker matcher is active; real transcription still works | Install ECAPA extras if better speaker recognition is needed |
+| Footer says `null`, or lines show `[speech …s]` | `CT_TRANSCRIBER=null` explicitly disables transcription | Remove that setting or use `CT_TRANSCRIBER=whisper`, then restart |
+| Startup says Whisper cannot load | Missing runtime, blocked model download, or incompatible device | Install `backend/requirements.txt`, allow Hugging Face model downloads, use `CT_DEVICE=cpu`, or point `CT_WHISPER_MODEL` at a downloaded model directory |
 | Terminal warning mentioning `huggingface.co` | No internet on first start, or a proxy blocks it | Connect and restart; later starts work offline |
+| Computer audio unavailable | Browser or OS does not support the requested tab/system audio | Try current Chrome/Edge with Discord in a browser tab; choose the tab and enable **Share audio** |
+| Shared source has no audio | Audio was not enabled, or that window/screen cannot share audio | Choose an audio-capable tab or supported system-audio share and enable audio; recording will not start without an audio track |
+| Your own voice is missing from Computer audio | The shared source does not contain your microphone | Computer audio does not mix in the local microphone; choose Microphone when you want to record that source instead |
 | Mic blocked or no prompt | Page not opened on `localhost`, or permission denied earlier | Use http://localhost:8000; reset site permissions in the browser |
 | `Address already in use` | Another server is on port 8000 | Stop it, or start with `CT_PORT=8001 python -m app` |
 | Lines labeled Unknown | Voice far from the enrollment samples | Add samples with **+ sample**, or lower `CT_MATCH_THRESHOLD` |

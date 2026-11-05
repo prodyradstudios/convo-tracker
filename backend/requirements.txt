@@ -1,8 +1,10 @@
-# Core runtime dependencies (no ML). With only these installed the app runs
-# with the MFCC embedder and the null transcriber.
+# Standard runtime: real Whisper transcription and the MFCC speaker matcher.
+# ECAPA speaker recognition remains optional (requirements-ml.txt).
 fastapi>=0.110
 uvicorn[standard]>=0.29
 numpy>=1.26
 scipy>=1.11
 soundfile>=0.12
 python-multipart>=0.0.9
+faster-whisper>=1.1
+av>=13

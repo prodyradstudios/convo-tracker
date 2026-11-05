@@ -32,18 +32,16 @@ def test_health(client):
     }
 
 
-def test_health_auto_mode_without_ml(monkeypatch, tmp_path, caplog):
+def test_auto_mode_requires_real_transcription(monkeypatch, tmp_path):
     import app.speakers.embedder as emb_mod
     import app.transcription.transcriber as tr_mod
 
     monkeypatch.setattr(emb_mod, "_ecapa_available", lambda: False)
     monkeypatch.setattr(tr_mod, "_whisper_available", lambda: False)
     settings = Settings(data_dir=tmp_path, embedder="auto", transcriber="auto")
-    with caplog.at_level("WARNING"):
-        with TestClient(create_app(settings, frontend_dir=None)) as c:
-            body = c.get("/api/health").json()
-    assert body == {"status": "ok", "embedder": "mfcc", "transcriber": "null"}
-    assert "falling back" in caplog.text and "faster-whisper" in caplog.text
+    with pytest.raises(RuntimeError, match="Speech-to-text requires faster-whisper"):
+        with TestClient(create_app(settings, frontend_dir=None)):
+            pass
 
 
 def test_enroll_list_and_speaker_shape(client):

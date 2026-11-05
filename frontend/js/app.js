@@ -1,7 +1,7 @@
 // UI wiring for Convo Tracker. All server/user text is rendered with textContent.
 
 import * as api from './api.js';
-import { MicCapture, primeAudio } from './audio.js';
+import { AudioCapture, primeAudio } from './audio.js';
 import { encodeWav } from './wav.js';
 import { SessionClient } from './session.js';
 
@@ -14,12 +14,16 @@ const STOP_MAX_MS = 120000;
 const SPEAKERS_RETRY_MAX_MS = 15000;
 const SAMPLE_RATE = 16000;
 const UNKNOWN_COLOR = '#888888';
+const TRANSCRIPTION_DISABLED_MESSAGE =
+  'Speech-to-text is disabled. Restart the server with CT_TRANSCRIBER=whisper to transcribe spoken words.';
 
 const $ = (id) => document.getElementById(id);
 const el = {
   banner: $('banner'),
   bannerText: $('banner-text'),
   bannerClose: $('banner-close'),
+  audioSource: $('audio-source'),
+  audioSourceHint: $('audio-source-hint'),
   removeAll: $('remove-all'),
   form: $('enroll-form'),
   name: $('name-input'),
@@ -27,6 +31,7 @@ const el = {
   enrollMeter: $('enroll-meter'),
   enrollError: $('enroll-error'),
   enrollStatus: $('enroll-status'),
+  enrollHint: $('enroll-hint'),
   people: $('people-list'),
   peopleEmpty: $('people-empty'),
   clear: $('clear-btn'),
@@ -42,7 +47,8 @@ const el = {
   health: $('health-text'),
 };
 
-const mic = new MicCapture();
+const capture = new AudioCapture();
+const selectedSource = () => el.audioSource.value === 'computer' ? 'computer' : 'microphone';
 
 const state = {
   speakers: [],
@@ -128,6 +134,14 @@ function render() {
   const { mode } = state;
   const rec = state.recording;
   const hasPeople = state.speakers.length > 0;
+  const computerAudio = selectedSource() === 'computer';
+  el.audioSource.disabled = mode !== 'idle' || state.busy > 0;
+  el.audioSourceHint.textContent = computerAudio
+    ? 'Choose the call’s tab or a screen with audio sharing, and enable “Share audio”. Available sources depend on your browser and computer. Only audio is sent; your microphone is not included.'
+    : 'Uses your microphone for voice samples and live transcription.';
+  el.enrollHint.textContent = computerAudio
+    ? 'Type a name, press Record, share the call’s audio and have only that person speak for 5–15 seconds.'
+    : 'Type a name, press Record and speak naturally for 5–15 seconds.';
 
   // Record button
   if (mode === 'recording' && rec) {
@@ -408,22 +422,27 @@ async function startRecording(target) {
   setEnrollStatus('');
   hideBanner();
 
-  const rec = { target, chunks: [], samples: 0, startedAt: performance.now(), timer: null, live: false };
+  const rec = { target, source: selectedSource(), chunks: [], samples: 0, startedAt: performance.now(), timer: null, live: false };
   state.recording = rec;
   state.mode = 'recording';
   setMeter(el.enrollMeter, 0);
   render();
+  capture.onended = () => {
+    if (state.recording === rec) finishRecording({ deviceLost: true });
+  };
 
   try {
-    await mic.start(
+    await capture.start(
       (chunk) => {
         rec.chunks.push(chunk);
         rec.samples += chunk.length;
       },
       (rms) => setMeter(el.enrollMeter, rms),
+      { source: rec.source },
     );
   } catch (err) {
     if (state.recording === rec) {
+      capture.onended = null;
       state.recording = null;
       state.mode = 'idle';
       setEnrollError(err.message);
@@ -433,12 +452,10 @@ async function startRecording(target) {
   }
   if (state.recording !== rec) return; // cancelled meanwhile
 
-  mic.onended = () => {
-    if (state.recording === rec) finishRecording({ deviceLost: true });
-  };
   rec.live = true;
   rec.startedAt = performance.now();
-  setEnrollStatus(target.kind === 'sample' ? `Recording another sample for ${target.name}… speak now.` : 'Recording… speak now.');
+  const instruction = rec.source === 'computer' ? 'have only this person speak in the call.' : 'speak now.';
+  setEnrollStatus(target.kind === 'sample' ? `Recording another sample for ${target.name}… ${instruction}` : `Recording… ${instruction}`);
   rec.timer = setInterval(() => {
     const elapsed = (performance.now() - rec.startedAt) / 1000;
     if (elapsed >= MAX_RECORD_S) finishRecording();
@@ -453,9 +470,10 @@ async function finishRecording({ deviceLost = false } = {}) {
   if (!rec || state.mode !== 'recording') return;
   clearInterval(rec.timer);
   state.mode = 'saving';
-  mic.onended = null;
+  capture.onended = null;
   render();
-  await mic.stop();
+  await capture.stop();
+  if (state.recording !== rec) return; // cancelled while leaving the page
   state.recording = null;
   setMeter(el.enrollMeter, 0);
 
@@ -463,7 +481,9 @@ async function finishRecording({ deviceLost = false } = {}) {
   if (deviceLost && seconds < MIN_RECORD_S) {
     state.mode = 'idle';
     setEnrollStatus('');
-    setEnrollError('The microphone stopped unexpectedly. Please try again.');
+    setEnrollError(rec.source === 'computer'
+      ? 'Audio sharing stopped before enough speech was recorded. Share audio and try again.'
+      : 'The microphone stopped unexpectedly. Please try again.');
     render();
     return;
   }
@@ -534,6 +554,7 @@ function clearStopTimer() {
 async function startListening() {
   if (state.mode !== 'idle' || !state.speakers.length) return;
   primeAudio(); // must run inside the click, before any await (Safari/iOS)
+  const source = selectedSource();
   hideBanner();
   state.mode = 'connecting';
   state.lastServerError = null;
@@ -557,6 +578,13 @@ async function startListening() {
       if (state.mode === 'finishing') return; // keep showing "Processing…"
       el.speech.classList.toggle('active', active);
       el.speechText.textContent = active ? 'Someone is speaking…' : 'Listening…';
+    },
+    onSpeaker: (speaker) => {
+      if (session !== state.session) return;
+      heardFromServer();
+      if (state.mode === 'finishing') return;
+      el.speech.classList.add('active');
+      el.speechText.textContent = `${String(speaker.speaker_name ?? 'Unknown')} is speaking…`;
     },
     onUtterance: (u) => {
       if (session !== state.session) return;
@@ -596,46 +624,45 @@ async function startListening() {
     },
   });
   state.session = session;
+  let audioReady = false;
+  capture.onended = () => {
+    if (session !== state.session) return;
+    const message = source === 'computer'
+      ? 'Audio sharing ended. Listening stopped.'
+      : 'The microphone stopped unexpectedly. Listening stopped.';
+    if (state.mode === 'connecting') {
+      endSession();
+      showBanner(message);
+    } else if (state.mode === 'listening') {
+      showBanner(message);
+      stopListening();
+    }
+  };
 
   try {
-    await session.connect();
+    // Display sharing requires the original click gesture. Request it before
+    // waiting for the socket; begin streaming only once both are ready.
+    const captured = capture.start(
+      (chunk) => { if (audioReady && session === state.session) session.sendAudio(chunk); },
+      (rms) => { if (session === state.session) setMeter(el.listenMeter, rms); },
+      { source },
+    );
+    await Promise.all([captured, session.connect()]);
   } catch (err) {
     if (state.session === session) {
-      state.session = null;
-      state.mode = 'idle';
+      endSession();
       showBanner(err.message);
-      render();
     }
     return;
   }
   if (state.session !== session) return;
 
-  session.start();
-  try {
-    await mic.start(
-      (chunk) => session.sendAudio(chunk),
-      (rms) => setMeter(el.listenMeter, rms),
-    );
-  } catch (err) {
-    if (state.session === session) {
-      state.session = null;
-      session.close();
-      state.mode = 'idle';
-      showBanner(err.message);
-      render();
-    }
+  if (!session.start()) {
+    endSession();
+    showBanner('The connection closed before listening could start. Please try again.');
     return;
   }
-  if (state.session !== session || state.mode !== 'connecting') {
-    mic.stop();
-    return;
-  }
-  mic.onended = () => {
-    if (state.session === session && state.mode === 'listening') {
-      showBanner('The microphone stopped unexpectedly. Listening stopped.');
-      stopListening();
-    }
-  };
+  audioReady = true;
 
   state.sessionCount++;
   if (state.lines.length) {
@@ -661,11 +688,11 @@ async function stopListening() {
   if (state.mode !== 'listening') return;
   const session = state.session;
   state.mode = 'finishing';
-  mic.onended = null;
+  capture.onended = null;
   el.speech.classList.remove('active');
   el.speechText.textContent = 'Processing the last speech…';
   render();
-  await mic.stop(); // flushes the final partial chunk through sendAudio
+  await capture.stop(); // flushes the final partial chunk through sendAudio
   if (state.session !== session) return; // socket died meanwhile
   if (!session.stop()) {
     endSession();
@@ -693,13 +720,13 @@ function armStopTimer(session) {
   }, Math.max(0, Math.min(STOP_IDLE_TIMEOUT_MS, left)));
 }
 
-/** Tear down the session (mic, socket, timers) and go back to idle. */
+/** Tear down the session (capture, socket, timers) and go back to idle. */
 function endSession({ socketGone = false } = {}) {
   clearStopTimer();
   const session = state.session;
   state.session = null;
-  mic.onended = null;
-  mic.stop();
+  capture.onended = null;
+  capture.stop();
   if (session && !socketGone) session.close();
   if (session && session.droppedChunks > 0) {
     console.warn(`Dropped ${session.droppedChunks} audio chunks because the connection was backed up.`);
@@ -761,10 +788,16 @@ async function loadHealth() {
     const parts = [`Speaker model: ${h.embedder}`, `Transcriber: ${h.transcriber}`];
     let note = '';
     if (h.embedder === 'mfcc') note += ' · basic speaker model (install ML extras for better accuracy)';
-    if (h.transcriber === 'null') note += ' · no speech-to-text installed (placeholders shown)';
+    if (h.transcriber === 'null') note += ' · speech-to-text disabled (durations only)';
     el.health.textContent = parts.join(' · ') + note;
     if (healthError && el.bannerText.textContent === healthError) hideBanner();
     healthError = null;
+    if (h.transcriber !== 'null' && el.bannerText.textContent === TRANSCRIPTION_DISABLED_MESSAGE) {
+      hideBanner();
+    }
+    if (h.transcriber === 'null' && el.banner.hidden) {
+      showBanner(TRANSCRIPTION_DISABLED_MESSAGE);
+    }
   } catch (err) {
     el.health.textContent = 'Server unreachable.';
     healthError = err.message;
@@ -792,6 +825,11 @@ el.listen.addEventListener('click', onListenClick);
 el.clear.addEventListener('click', clearFeed);
 el.exportBtn.addEventListener('click', exportFeed);
 el.bannerClose.addEventListener('click', hideBanner);
+el.audioSource.addEventListener('change', () => {
+  setEnrollError('');
+  setEnrollStatus('');
+  render();
+});
 el.feed.addEventListener('scroll', () => {
   state.stickToBottom = isNearBottom();
   if (state.stickToBottom) el.jump.hidden = true;
@@ -803,8 +841,21 @@ el.jump.addEventListener('click', () => {
 });
 window.addEventListener('focus', () => refreshSpeakers());
 window.addEventListener('pagehide', () => {
-  mic.stop();
-  if (state.session) state.session.close();
+  // A page can return from the back-forward cache with its JS state intact.
+  // Clear active operations as well as resources so it returns ready to start.
+  if (state.recording) {
+    clearInterval(state.recording.timer);
+    state.recording = null;
+    state.mode = 'idle';
+    setEnrollStatus('');
+    setMeter(el.enrollMeter, 0);
+  }
+  if (state.session) endSession();
+  else {
+    capture.onended = null;
+    capture.stop();
+    render();
+  }
 });
 
 render();

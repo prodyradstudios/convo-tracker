@@ -224,3 +224,32 @@ def test_backlog_is_capped_by_dropping_oldest_utterance(monkeypatch):
         await asyncio.wait_for(task, 3)
 
     asyncio.run(scenario())
+
+
+def test_speaker_change_is_announced_while_previous_transcription_is_blocked():
+    async def scenario() -> None:
+        tr = GatedTranscriber()
+        handler, ws = make_handler(tr)
+        for name, freq in (("Alice", 200), ("Bob", 400)):
+            handler.state.registry.enroll(name, handler.state.embedder.embed(tone(1.0, freq)))
+        task = asyncio.create_task(handler.run())
+        try:
+            ws.text("start")
+            ws.audio(np.concatenate([silence(0.3), tone(1.5, 200)]))
+            await wait_until(lambda: any(e.get("speaker_name") == "Alice" for e in ws.of_type("speaker")))
+            ws.audio(tone(0.6, 400))
+            await wait_until(lambda: any(e.get("speaker_name") == "Bob" for e in ws.of_type("speaker")))
+            await wait_until(lambda: tr.calls >= 1)
+            assert ws.of_type("utterance") == []
+            bob = next(e for e in ws.of_type("speaker") if e["speaker_name"] == "Bob")
+            assert bob["start"] == pytest.approx(1.8, abs=0.1)
+            tr.gate.set()
+            ws.text("stop")
+            await wait_until(lambda: "stopped" in kinds(ws))
+            assert [u["speaker_name"] for u in ws.of_type("utterance")] == ["Alice", "Bob"]
+        finally:
+            tr.gate.set()
+            ws.disconnect()
+            await asyncio.wait_for(task, 3)
+
+    asyncio.run(scenario())

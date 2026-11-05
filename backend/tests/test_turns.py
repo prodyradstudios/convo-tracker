@@ -82,12 +82,13 @@ def test_turns_with_padding_and_three_voices():
 
 @pytest.mark.parametrize("blip", [0.4, 0.8])
 @pytest.mark.parametrize("embedder", [FakeEmbedder(), BandEmbedder()], ids=["onehot", "band"])
-def test_short_blip_of_other_voice_is_smoothed_away(embedder, blip):
+def test_short_confident_interruption_survives_smoothing(embedder, blip):
     reg, names = enrolled(embedder, A, B)
     audio = np.concatenate([tone(3.0, A), tone(blip, B), tone(3.0, A)])
     turns = detect_turns(audio, embedder, reg)
-    assert summary(turns, names) == ["A"]
-    assert (turns[0].start, turns[0].end) == (0.0, pytest.approx(audio.size / SR))
+    assert summary(turns, names) == ["A", "B", "A"]
+    assert turns[0].end == pytest.approx(3.0, abs=0.2)
+    assert turns[1].end == pytest.approx(3.0 + blip, abs=0.2)
 
 
 @pytest.mark.parametrize("embedder", [FakeEmbedder(), BandEmbedder()], ids=["onehot", "band"])
@@ -106,9 +107,9 @@ def test_unknown_voice_gets_its_own_turn():
 
 def test_nothing_to_split():
     emb = BandEmbedder()
-    reg, _ = enrolled(emb, A)  # one speaker: no turns
+    reg, names = enrolled(emb, A)
     audio = np.concatenate([tone(3.0, A), tone(3.0, B)])
-    assert len(detect_turns(audio, emb, reg)) == 1
+    assert summary(detect_turns(audio, emb, reg), names) == ["A", "?"]
     reg, _ = enrolled(emb, A, B)
     assert len(detect_turns(tone(1.8, A), emb, reg)) == 1  # shorter than two windows
     # Mostly silence: windows are skipped, nothing to compare.
@@ -130,8 +131,7 @@ def test_window_count_is_capped_and_batched():
     emb = BandEmbedder()
     reg, _ = enrolled(emb, A, B)
     detect_turns(np.concatenate([tone(15.0, A), tone(15.0, B)]), emb, reg)
-    # One batch of chunks tiling the segment (they disagree), then one batch of
-    # the remaining windows: at most 40 windows in all (hop grew).
+    # Strong changes need only the bounded short-window batch.
     assert len(emb.batches) == 2 and sum(emb.batches) == 40
     starts = window_starts(30 * SR, int(1.5 * SR), int(0.5 * SR), 40)
     assert len(starts) == 40 and starts[0] == 0 and starts[-1] == 30 * SR - int(1.5 * SR)
@@ -142,8 +142,8 @@ def test_falls_back_to_embed_when_no_batch_support():
     reg, _ = enrolled(emb, A, B)
     calls = emb.calls
     detect_turns(np.concatenate([tone(3.0, A), tone(3.0, B)]), emb, reg)
-    # Chunk embeddings are reused: each window is embedded once.
-    assert emb.calls - calls == len(window_starts(6 * SR, int(1.5 * SR), int(0.5 * SR), 40))
+    # Each short window is embedded once, including without a batch API.
+    assert emb.calls - calls == len(window_starts(6 * SR, int(0.4 * SR), int(0.1 * SR), 40))
 
 
 # -- label smoothing (pure) -----------------------------------------------------
@@ -266,22 +266,57 @@ def test_chunk_precheck_skips_windows_for_one_clear_voice():
     reg, names = enrolled(emb, A, B)
     audio = np.concatenate([silence(0.3), tone(14.5, A), silence(0.2)])  # 15 s
     result = analyze_turns(audio, emb, reg)
-    assert emb.batches == [10]  # ten 1.5 s chunks, no other sliding windows
+    assert len(emb.batches) == 2 and emb.batches[0] <= 40
+    assert emb.batches[1] == 10  # coarse analysis still skips its sliding windows
     assert summary(result.turns, names) == ["A"] and result.clean
     np.testing.assert_allclose(result.embedding, emb.embed(tone(2.0, A)), atol=1e-2)
     # Two voices: the chunks disagree, so the fine windows run as well.
     emb.batches.clear()
     result = analyze_turns(np.concatenate([tone(6.0, A), tone(6.0, B)]), emb, reg)
-    assert len(emb.batches) == 2 and summary(result.turns, names) == ["A", "B"]
-    assert sum(emb.batches) == len(window_starts(12 * SR, int(1.5 * SR), int(0.5 * SR), 40))
+    assert emb.batches == [40] and summary(result.turns, names) == ["A", "B"]
     assert not result.clean
 
 
 def test_disagreeing_window_marks_segment_unclean():
-    """A blip of another voice is smoothed away but the segment is not 'clean'."""
+    """A brief confident interruption must prevent adaptation of a mixed segment."""
     emb = BandEmbedder()
     reg, names = enrolled(emb, A, B)
     # 6.5 s: chunks at 0, 1.5, 3.0 ... s; the one at 3.0 s is half B (ambiguous).
     result = analyze_turns(np.concatenate([tone(3.0, A), tone(0.8, B), tone(2.7, A)]), emb, reg)
-    assert summary(result.turns, names) == ["A"]
+    assert summary(result.turns, names) == ["A", "B", "A"]
     assert not result.clean
+
+
+@pytest.mark.parametrize("first, second", [(0.8, 0.8), (0.6, 0.6)])
+def test_fast_analysis_splits_below_old_two_second_guard(first, second):
+    emb = BandEmbedder()
+    reg, names = enrolled(emb, A, B)
+    turns = detect_turns(np.concatenate([tone(first, A), tone(second, B)]), emb, reg)
+    assert summary(turns, names) == ["A", "B"]
+    assert turns[0].end == pytest.approx(first, abs=0.15)
+
+
+def test_sub_confirmation_blip_still_smoothed():
+    emb = BandEmbedder()
+    reg, names = enrolled(emb, A, B)
+    audio = np.concatenate([tone(3.0, A), tone(0.08, B), tone(3.0, A)])
+    assert summary(detect_turns(audio, emb, reg), names) == ["A"]
+
+
+def test_distance_threshold_gates_strong_short_interruption():
+    emb = BandEmbedder()
+    reg, names = enrolled(emb, A, B)
+    audio = np.concatenate([tone(3.0, A), tone(0.4, B), tone(3.0, A)])
+    cfg = TurnConfig(change_threshold=1.1)
+    assert summary(detect_turns(audio, emb, reg, cfg), names) == ["A"]
+
+
+def test_sparse_short_observations_do_not_fabricate_long_turn():
+    emb = BandEmbedder()
+    reg, names = enrolled(emb, A, B)
+    audio = tone(300.0, A)
+    starts = window_starts(len(audio), int(0.4 * SR), int(0.1 * SR), 40)
+    for start in starts[10:12]:
+        audio[start:start + int(0.4 * SR)] = tone(0.4, B)
+    turns = detect_turns(audio, emb, reg)
+    assert summary(turns, names) == ["A"]

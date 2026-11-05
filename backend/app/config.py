@@ -68,6 +68,11 @@ class Settings:
     turn_window_s: float = 1.5
     turn_hop_s: float = 0.5
     turn_min_s: float = 1.0
+    turn_change_window_s: float = 0.4
+    turn_change_hop_s: float = 0.1
+    turn_change_margin: float = 0.15
+    turn_change_confirm_s: float = 0.2
+    turn_change_threshold: float = 0.35
     # Robustness to voice variation (speakers/embedder.py, speakers/registry.py).
     enroll_augment: bool = True
     adapt: bool = True
@@ -112,6 +117,15 @@ class Settings:
         )
         check("CT_TURN_HOP_S", hop, 0 < hop <= win, f"> 0 and <= CT_TURN_WINDOW_S ({win})")
         check("CT_TURN_MIN_S", self.turn_min_s, self.turn_min_s >= 0, ">= 0")
+        cw, ch = self.turn_change_window_s, self.turn_change_hop_s
+        check("CT_TURN_CHANGE_WINDOW_S", cw, 0.2 <= cw <= 2.0, "in [0.2, 2]")
+        check("CT_TURN_CHANGE_HOP_S", ch, 0.03 <= ch <= cw, "in [0.03, CT_TURN_CHANGE_WINDOW_S]")
+        check("CT_TURN_CHANGE_CONFIRM_S", self.turn_change_confirm_s,
+              ch <= self.turn_change_confirm_s <= 2.0, "between change hop and 2 seconds")
+        check("CT_TURN_CHANGE_MARGIN", self.turn_change_margin,
+              0 <= self.turn_change_margin <= 2, "in [0, 2]")
+        check("CT_TURN_CHANGE_THRESHOLD", self.turn_change_threshold,
+              0 <= self.turn_change_threshold <= 2, "in [0, 2]")
         for env, flag in (("CT_ENROLL_AUGMENT", self.enroll_augment), ("CT_ADAPT", self.adapt)):
             if not isinstance(flag, bool):
                 raise ValueError(f"{env} must be a boolean, got {flag!r}")
@@ -137,6 +151,11 @@ class Settings:
             turn_window_s=_num(env, "CT_TURN_WINDOW_S", 1.5, float),
             turn_hop_s=_num(env, "CT_TURN_HOP_S", 0.5, float),
             turn_min_s=_num(env, "CT_TURN_MIN_S", 1.0, float),
+            turn_change_window_s=_num(env, "CT_TURN_CHANGE_WINDOW_S", 0.4, float),
+            turn_change_hop_s=_num(env, "CT_TURN_CHANGE_HOP_S", 0.1, float),
+            turn_change_margin=_num(env, "CT_TURN_CHANGE_MARGIN", 0.15, float),
+            turn_change_confirm_s=_num(env, "CT_TURN_CHANGE_CONFIRM_S", 0.2, float),
+            turn_change_threshold=_num(env, "CT_TURN_CHANGE_THRESHOLD", 0.35, float),
             enroll_augment=_flag(env, "CT_ENROLL_AUGMENT", True),
             adapt=_flag(env, "CT_ADAPT", True),
         )

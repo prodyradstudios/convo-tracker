@@ -1,4 +1,4 @@
-# Optional ML backends: ECAPA speaker embeddings (SpeechBrain) + faster-whisper STT.
+# Optional ECAPA speaker embeddings (SpeechBrain); Whisper STT is in requirements.txt.
 #
 # Use Python 3.11-3.13 (3.12 recommended). Newer Pythons may not have prebuilt
 # wheels yet, and pip will then try to compile PyAV/onnxruntime from source and fail.
@@ -8,9 +8,6 @@
 # On macOS plain `pip install -r requirements-ml.txt` is fine (PyPI torch is CPU/MPS).
 # Models are fetched from huggingface.co on first start (ECAPA + Whisper).
 -r requirements.txt
-# >=1.1 drops the old `av<13` pin that forces a source build of PyAV.
-faster-whisper>=1.1
-av>=13
 speechbrain>=1.0
 torch>=2.1
 torchaudio>=2.1

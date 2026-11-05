@@ -24,9 +24,9 @@ backend/
     transcription/__init__.py
     transcription/transcriber.py  # Transcriber protocol, WhisperTranscriber (faster-whisper), NullTranscriber
     pipeline.py             # SessionPipeline: VAD -> turns -> embed -> identify -> transcribe -> Utterances
-  tests/                    # pytest; must run with NO ML packages installed (use mfcc + null/fake transcriber)
-  requirements.txt          # core: fastapi, uvicorn[standard], numpy, scipy, soundfile, python-multipart
-  requirements-ml.txt       # -r requirements.txt + faster-whisper, speechbrain, torch, torchaudio
+  tests/                    # pytest; no model downloads required (use mfcc + null/fake transcriber)
+  requirements.txt          # standard runtime: FastAPI, audio libraries, faster-whisper and PyAV
+  requirements-ml.txt       # -r requirements.txt + speechbrain, torch, torchaudio
   requirements-dev.txt      # -r requirements.txt + pytest, httpx
   pyproject.toml            # pytest config (testpaths, pythonpath)
 frontend/
@@ -34,7 +34,7 @@ frontend/
   styles.css
   js/app.js                 # UI wiring
   js/api.js                 # fetch wrappers for REST
-  js/audio.js               # mic capture via AudioWorklet, emits 16 kHz Int16 chunks
+  js/audio.js               # microphone/display-audio capture via AudioWorklet, emits 16 kHz Int16 chunks
   js/pcm-worklet.js         # AudioWorkletProcessor: downsample to 16 kHz mono, post Int16Array chunks
   js/wav.js                 # encode Int16 PCM -> WAV Blob (16 kHz mono 16-bit)
   js/session.js             # WebSocket client for /ws/session
@@ -64,6 +64,15 @@ Errors: `{"detail": str}` with status 400 (bad name, unreadable audio or sample 
 
 Colors are assigned server-side from a fixed palette of 8 distinct colors, cycling.
 
+Speech-to-text is included in the standard runtime dependencies. `CT_TRANSCRIBER=auto`
+and `whisper` both load faster-whisper; missing packages, inaccessible model
+downloads, and model-load errors fail startup with an actionable error. They do
+not silently fall back to duration text. Only explicit `CT_TRANSCRIBER=null`
+selects the development placeholder, with a terminal warning and UI banner.
+`CT_WHISPER_MODEL` defaults to `base.en` and also accepts a downloaded model
+directory for offline operation. Tests inject fake models and require no model
+downloads.
+
 ## WebSocket `/ws/session`
 
 Client → server:
@@ -75,6 +84,7 @@ Client → server:
 Server → client:
 - `{"type":"status","state":"listening"|"stopped"}`
 - `{"type":"speech","active":true|false}` — VAD speech start/end (for a "someone is talking" indicator).
+- `{"type":"speaker","speaker_id":str|null,"speaker_name":str,"color":str,"confidence":float,"start":float}` — live speaker identification or a confirmed change. `start` is the estimated turn boundary in session seconds. The client updates its speaking indicator immediately; this event contains no transcript text and does not consume an utterance sequence number. Final text follows in `utterance` messages after transcription.
 - `{"type":"utterance","id":str,"seq":int,"speaker_id":str|null,"speaker_name":str,"color":str,"text":str,"start":float,"end":float,"confidence":float}`
   - `seq` starts at 1 per session and increases in order. `start`/`end` are seconds since session start.
   - `speaker_id` null and `speaker_name` "Unknown" (color `#888888`) when no enrolled speaker scores >= threshold.
@@ -138,7 +148,37 @@ Segmenter API: `feed(samples: np.ndarray) -> list[Segment]`, `flush() -> list[Se
 
 ## Speaker turns (splitting a segment when the speaker changes without a pause)
 
-Runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGMENT_S` (default 2.0) when at least 2 speakers are enrolled.
+### Online handoff
+
+While audio arrives, a separate short-window detector checks active speech using
+`CT_TURN_CHANGE_WINDOW_S` (default 0.4 s) and `CT_TURN_CHANGE_HOP_S` (0.1 s).
+A switch needs a different confidently enrolled identity (or confidently Unknown),
+a cosine distance of at least `CT_TURN_CHANGE_THRESHOLD` (0.35) from the active
+voice, and sustained evidence for `CT_TURN_CHANGE_CONFIRM_S` (0.2 s, at least two
+probes). `CT_TURN_CHANGE_MARGIN` (0.15) rejects ambiguous identities.
+These controls apply independently of the coarse minimum segment/turn durations.
+
+A cheap MFCC novelty check reduces full-model calls; periodic full-model probes
+prevent the cheap check from indefinitely suppressing a genuine change. Candidate
+changes bypass the cheap gate for confirmation. Short-window evidence never
+adapts speaker voiceprints. Model work runs off the event loop.
+
+Confirmed changes cut the active VAD audio at a refined acoustic boundary without
+waiting for silence or sending a false speech-end event. The old turn is queued
+for transcription and a `speaker` event announces the new live identity. The
+suffix keeps its audio and a handoff marker so previous-speaker continuity cannot
+pull it back into the old speaker. Confirmation and model compute add latency;
+the configured audio windows are not a wall-clock latency guarantee.
+
+### Completed-segment analysis
+
+A bounded confidence-gated short-window pass protects clear brief interruptions
+before the conservative coarse pass below. Strong changes require sustained,
+contiguous evidence and a large embedding distance; they are not erased by the
+coarse minimum-turn smoothing. A single enrolled speaker can transition to Unknown.
+
+The coarse fallback runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGMENT_S`
+(default 2.0) when at least 2 speakers are enrolled.
 
 1. Windows of `CT_TURN_WINDOW_S` (default 1.5 s) every `CT_TURN_HOP_S` (default 0.5 s), evenly spread over the segment audio;
    at most 40 windows (the hop grows if needed). Windows with fewer than 50 % voiced 30 ms frames are skipped. Voiced uses the VAD's
@@ -163,15 +203,15 @@ Runs for a segment with `speech_seconds >= CT_TURN_MIN_SEGMENT_S` (default 2.0) 
 If there is one turn, the segment is handled as a single utterance (identity from the chunk-mean embedding, or a whole-segment
 embedding when turn analysis did not run). Otherwise:
 - `transcribe_words` returns the words with timestamps, `[]` when nothing was said, or `None` when the transcriber has no word
-  timing (the null transcriber; a transcriber without the method counts as `None`; Whisper returns `None` if a segment has text
-  but no words).
+  timing (the null transcriber; a transcriber without the method counts as `None`; Whisper returns `None` if recognized text has
+  no usable word metadata, including missing, invalid or reversed timestamps). This uses per-turn audio transcription rather than dropping recognized speech.
 - With words: each word goes to the turn containing its midpoint (words sorted by midpoint; a non-finite time borrows the other
   end or the previous word's time); consecutive words of one turn form a piece whose `start`/`end` snap to its first/last word,
   clamped to the clip; overlapping pieces are cut at the turn boundary, and a piece with no length takes its turn's span. Pieces
   are in time order with `start < end`. Text is the words concatenated as given (Whisper words carry their own leading space; CJK
   words none). `[]`: no utterance for the segment.
 - With `None`: the audio is cut at the turn boundaries and each piece is transcribed separately.
-- Each piece of >= 1.0 s is re-identified from an embedding of its own audio; shorter pieces keep their turn's label and score.
+- Each piece of >= 1.0 s is re-identified from its turn's acoustic span, without previous-speaker continuity bias; shorter pieces keep their turn's label and score. Word-timestamp spans are clamped to their assigned turn so a mistimed word cannot pull another speaker's audio into re-identification.
   Empty-text pieces are dropped, then adjacent pieces with the same speaker (or both Unknown) are merged (confidence = duration-weighted
   mean). If every turn produced text and they all merge into one speaker (a false split), the segment is handled as unsplit.
 - Each remaining piece is its own utterance with its own `seq`, in time order.
@@ -197,6 +237,11 @@ Invalid values fail at startup with a `ValueError` naming the variable.
 - Panel 1 "People": name input + Record button. Record → button becomes "Stop (0:07)" with live timer and a level meter; auto-stops at 15 s; requires >= 3 s before Stop is enabled. On stop, encode WAV and POST `/api/speakers`. Show errors inline. Under the record button a tip suggests 2–3 samples per person
   (normal voice, louder/more animated, quieter) via "+ sample". Below: list of enrolled people (color dot, name, sample count, "+ sample" button, delete ✕).
 - Panel 2 "Conversation": Start / Stop listening button (disabled with a hint while 0 people enrolled), speech indicator, Clear and Export (.txt download) buttons. Feed of lines: colored name chip, text, mm:ss timestamp, confidence shown as tooltip. Auto-scrolls to bottom unless user scrolled up.
-- Mic: `getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}})`. One shared AudioContext; worklet posts Int16 chunks of 1600 samples (100 ms at 16 kHz).
+- **Audio input**: one selector chooses **Microphone** (default) or **Computer audio** for both enrollment/add-sample recording and live listening. The selected source is captured for the operation; source changes are disabled while capture is starting or active.
+- Microphone capture uses `getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}})`.
+- Computer-audio capture uses browser `getDisplayMedia` with audio requested and the video-surface selection required by that API. Invoke it from the user's recording/listening gesture. The browser presents a fresh share chooser for each enrollment sample and listening session. Require at least one audio track; unsupported capture, denial/cancellation, and a share containing no audio must produce an explanatory error and release acquired tracks. Only audio enters the processing graph and backend requests; display video is never uploaded or sent over the WebSocket.
+- Both sources use the same AudioWorklet to downmix/resample to 16 kHz mono Int16 chunks of 1600 samples (100 ms), with one shared AudioContext. Computer audio does not request or mix in a local microphone. Source selection does not change the REST enrollment format or WebSocket protocol.
+- For Discord, recommend sharing its browser tab with **Share audio** enabled. Native-app capture requires a screen/system-audio source actually offered by the browser and OS; window/screen audio is not guaranteed. If unavailable, recommend browser-tab Discord. Enroll remote speakers individually from the same shared source, with other participants quiet.
+- All capture requires a secure context (`localhost` or HTTPS). Stop/cleanup releases all acquired audio/video tracks and disconnects processing nodes; ending the shared source stops the active operation. No browser extension, bot, or additional application dependency is required.
 - WebSocket URL derived from `location` (ws/wss). Handle close/error: show banner, reset button state.
 - Accessible: buttons have labels, feed is `aria-live="polite"`.

@@ -13,6 +13,7 @@ export class SessionClient {
    * @param {{
    *   onStatus?: (state: 'listening'|'stopped') => void,
    *   onSpeech?: (active: boolean) => void,
+   *   onSpeaker?: (speaker: object) => void,
    *   onUtterance?: (u: object) => void,
    *   onError?: (message: string) => void,
    *   onClose?: (info: {expected: boolean, code: number, reason: string}) => void,
@@ -134,6 +135,9 @@ export class SessionClient {
         break;
       case 'speech':
         if (h.onSpeech) h.onSpeech(!!msg.active);
+        break;
+      case 'speaker':
+        if (h.onSpeaker) h.onSpeaker(msg);
         break;
       case 'utterance':
         if (h.onUtterance) h.onUtterance(msg);
