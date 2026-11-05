@@ -25,7 +25,7 @@ backend/
     transcription/transcriber.py  # Transcriber protocol, WhisperTranscriber (faster-whisper), NullTranscriber
     pipeline.py             # SessionPipeline: VAD -> turns -> embed -> identify -> transcribe -> Utterances
   tests/                    # pytest; no model downloads required (use mfcc + null/fake transcriber)
-  requirements.txt          # core: fastapi, uvicorn[standard], numpy, scipy, soundfile, python-multipart
+  requirements.txt          # standard runtime: FastAPI, audio libraries, faster-whisper and PyAV
   requirements-ml.txt       # -r requirements.txt + speechbrain, torch, torchaudio
   requirements-dev.txt      # -r requirements.txt + pytest, httpx
   pyproject.toml            # pytest config (testpaths, pythonpath)
@@ -34,7 +34,7 @@ frontend/
   styles.css
   js/app.js                 # UI wiring
   js/api.js                 # fetch wrappers for REST
-  js/audio.js               # mic capture via AudioWorklet, emits 16 kHz Int16 chunks
+  js/audio.js               # microphone/display-audio capture via AudioWorklet, emits 16 kHz Int16 chunks
   js/pcm-worklet.js         # AudioWorkletProcessor: downsample to 16 kHz mono, post Int16Array chunks
   js/wav.js                 # encode Int16 PCM -> WAV Blob (16 kHz mono 16-bit)
   js/session.js             # WebSocket client for /ws/session
@@ -237,6 +237,11 @@ Invalid values fail at startup with a `ValueError` naming the variable.
 - Panel 1 "People": name input + Record button. Record → button becomes "Stop (0:07)" with live timer and a level meter; auto-stops at 15 s; requires >= 3 s before Stop is enabled. On stop, encode WAV and POST `/api/speakers`. Show errors inline. Under the record button a tip suggests 2–3 samples per person
   (normal voice, louder/more animated, quieter) via "+ sample". Below: list of enrolled people (color dot, name, sample count, "+ sample" button, delete ✕).
 - Panel 2 "Conversation": Start / Stop listening button (disabled with a hint while 0 people enrolled), speech indicator, Clear and Export (.txt download) buttons. Feed of lines: colored name chip, text, mm:ss timestamp, confidence shown as tooltip. Auto-scrolls to bottom unless user scrolled up.
-- Mic: `getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}})`. One shared AudioContext; worklet posts Int16 chunks of 1600 samples (100 ms at 16 kHz).
+- **Audio input**: one selector chooses **Microphone** (default) or **Computer audio** for both enrollment/add-sample recording and live listening. The selected source is captured for the operation; source changes are disabled while capture is starting or active.
+- Microphone capture uses `getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}})`.
+- Computer-audio capture uses browser `getDisplayMedia` with audio requested and the video-surface selection required by that API. Invoke it from the user's recording/listening gesture. The browser presents a fresh share chooser for each enrollment sample and listening session. Require at least one audio track; unsupported capture, denial/cancellation, and a share containing no audio must produce an explanatory error and release acquired tracks. Only audio enters the processing graph and backend requests; display video is never uploaded or sent over the WebSocket.
+- Both sources use the same AudioWorklet to downmix/resample to 16 kHz mono Int16 chunks of 1600 samples (100 ms), with one shared AudioContext. Computer audio does not request or mix in a local microphone. Source selection does not change the REST enrollment format or WebSocket protocol.
+- For Discord, recommend sharing its browser tab with **Share audio** enabled. Native-app capture requires a screen/system-audio source actually offered by the browser and OS; window/screen audio is not guaranteed. If unavailable, recommend browser-tab Discord. Enroll remote speakers individually from the same shared source, with other participants quiet.
+- All capture requires a secure context (`localhost` or HTTPS). Stop/cleanup releases all acquired audio/video tracks and disconnects processing nodes; ending the shared source stops the active operation. No browser extension, bot, or additional application dependency is required.
 - WebSocket URL derived from `location` (ws/wss). Handle close/error: show banner, reset button state.
 - Accessible: buttons have labels, feed is `aria-live="polite"`.

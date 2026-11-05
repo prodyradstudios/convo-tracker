@@ -20,6 +20,15 @@
     <button type="button" id="banner-close" class="icon-btn" aria-label="Dismiss message">✕</button>
   </div>
 
+  <div class="audio-input">
+    <label for="audio-source">Audio input</label>
+    <select id="audio-source" aria-describedby="audio-source-hint">
+      <option value="microphone">Microphone</option>
+      <option value="computer">Computer audio</option>
+    </select>
+    <p id="audio-source-hint" class="hint">Uses your microphone for voice samples and live transcription.</p>
+  </div>
+
   <main class="panels">
     <!-- People -->
     <section class="panel" aria-labelledby="people-heading">

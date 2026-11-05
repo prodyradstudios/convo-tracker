@@ -85,7 +85,7 @@ The page has two panels: **People** (enroll voices) and **Conversation** (live l
 | Speaking indicator | `js/app.js` | Lights up while VAD hears speech and shows the speaker name when a live `speaker` event arrives. |
 | Conversation feed | `js/app.js` | One line per utterance: colored name chip, text, mm:ss time, confidence on hover. Unknown lines are muted. Auto-scrolls unless you scrolled up. `aria-live="polite"`. |
 | Clear / Export | `js/app.js` | Clear the feed; download a `.txt` of `[mm:ss] Name: text` lines. |
-| Mic capture | `js/audio.js` | `MicCapture` class: one shared AudioContext, `getUserMedia` with echo cancellation and noise suppression, clean teardown, friendly permission errors. |
+| Audio capture | `js/audio.js` | `AudioCapture` class: microphone via `getUserMedia`, or shared computer audio via `getDisplayMedia`; both use the same AudioWorklet. The common Audio input selector applies to enrollment and live transcription. Only audio is sent; microphone audio is not mixed into computer capture. `MicCapture` remains a compatibility alias. |
 | PCM worklet | `js/pcm-worklet.js` | AudioWorkletProcessor: downmix to mono, resample to 16 kHz without drift between blocks, convert to Int16, post 100 ms chunks (1,600 samples) plus an RMS level. |
 | WAV encoder | `js/wav.js` | Wraps recorded Int16 chunks in a 44-byte RIFF header for upload. |
 | REST client | `js/api.js` | `fetch` wrappers; surfaces the server's `detail` message on errors. |

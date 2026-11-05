@@ -66,6 +66,25 @@ h2 { font-size: 1.05rem; }
 }
 .tagline { margin: 0; color: var(--muted); }
 
+.audio-input {
+  margin: 4px 20px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+}
+.audio-input label { font-weight: 550; }
+.audio-input select {
+  font: inherit;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+.audio-input select:disabled { opacity: 0.6; }
+.audio-input .hint { flex-basis: 100%; margin: 0; }
+
 .app-footer {
   padding: 8px 20px 14px;
   color: var(--muted);
@@ -346,6 +365,7 @@ input[type="text"]:focus-visible { outline-offset: 0; }
   .panels { grid-template-columns: 1fr; padding: 8px 12px; }
   .app-header { padding: 14px 12px 6px; }
   .banner { margin: 4px 12px 8px; }
+  .audio-input { margin: 4px 12px 8px; }
   .app-footer { padding: 8px 12px 14px; }
   .panels { flex: none; }
   .feed-wrap { height: 60vh; min-height: 260px; flex: none; }

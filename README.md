@@ -2,10 +2,10 @@
 
 Tracks a conversation and labels who said what.
 
-Version 1 enrolls voices first. Each person records a short voice sample and types their name. The app then listens to the room and writes a live transcript where every line is attributed to the closest enrolled voice. Lines that match no one well enough are labeled **Unknown**.
+Version 1 enrolls voices first. Each person records a short voice sample and types their name. The app then listens to the selected microphone or shared computer audio and writes a live transcript where every line is attributed to the closest enrolled voice. Lines that match no one well enough are labeled **Unknown**.
 
 - **Backend** (`backend/`): Python, FastAPI. A streaming VAD splits the audio into utterances. SpeechBrain ECAPA voiceprints, compared by cosine similarity, identify the speaker, and faster-whisper transcribes the speech.
-- **Frontend** (`frontend/`): plain HTML, CSS and JavaScript, with no build step. Mic audio is captured with an AudioWorklet, resampled to 16 kHz and streamed over a WebSocket.
+- **Frontend** (`frontend/`): plain HTML, CSS and JavaScript, with no build step. Microphone or browser-shared computer audio passes through an AudioWorklet, is resampled to 16 kHz mono, and streams over a WebSocket.
 - **Contract** (`docs/SPEC.md`): the REST and WebSocket API, audio format and algorithms.
 - **Run guide** (`docs/run-system.md`): step-by-step local setup, configuration and troubleshooting.
 - **Design guide** (`docs/BUILD_GUIDE.md`): architecture, components, algorithm and roadmap. Start here to iterate on the idea.
@@ -21,10 +21,10 @@ pip install -r backend/requirements-ml.txt
 cd backend && python -m app
 ```
 
-Open <http://localhost:8000>. Browsers only allow the microphone on `localhost` or HTTPS.
+Open <http://localhost:8000>. Audio capture requires `localhost` or HTTPS. Select **Microphone** or **Computer audio** under **Audio input**; the same selection is used for enrollment and listening.
 
-1. In **People**, type a name, press **Record**, speak for about 8 seconds, and press **Stop**. Repeat this for everyone. Use **+ sample** to improve a person's match.
-2. In **Conversation**, press **Start listening** and talk.
+1. In **People**, type a name, press **Record**, capture about 8 seconds of that person speaking alone, and press **Stop**. Repeat this for everyone, using the input source where their voice is heard. Use **+ sample** to improve a person's match.
+2. In **Conversation**, press **Start listening** and begin the conversation. In **Computer audio** mode, choose the audio source in the browser sharing dialog each time you start recording or listening.
 3. Press **Stop listening** when you're done. **Export** downloads the transcript as `.txt`.
 
 On Linux or Windows, add `--extra-index-url https://download.pytorch.org/whl/cpu` to the install line for smaller CPU-only PyTorch.
@@ -37,12 +37,26 @@ If you see only speech durations, remove `CT_TRANSCRIBER=null` from your startup
 
 See [`backend/README.md`](backend/README.md) for configuration (`CT_*` environment variables) and tests.
 
+## Discord and computer audio
+
+Select **Computer audio** to transcribe audio played by a browser tab or another shareable source. For Discord, prefer Discord in a browser tab: choose that tab in the browser sharing dialog and enable **Share audio**. For the native Discord app, select an entire screen and enable system audio **if your browser and operating system offer it**. Window/screen audio capture varies by browser, OS, and source; native app capture is not universally available. If it is unavailable, use Discord in a browser tab with audio sharing.
+
+Enroll remote speakers one at a time using the same shared source, with everyone else quiet. The browser asks you to select the shared source again for each enrollment sample and each listening session. It may require a screen/tab video selection to grant audio capture; only audio is sent to Convo Tracker. **Computer audio** does not mix in your local microphone, so your own microphone voice is excluded unless it is already present in the shared audio. The app reports an error if capture is unsupported or the selected share contains no audio track; choose an audio-capable source and enable sharing audio. This feature uses browser APIs and needs no additional application dependencies.
+
 ## Tests
 
 ```bash
 pip install -r backend/requirements-dev.txt
 cd backend && python -m pytest -q
 ```
+
+Frontend capture and socket tests (Node 24, from the repository root):
+
+```bash
+node --test --test-isolation=none frontend/tests/*.test.mjs
+```
+
+The browser integration tests use Playwright and Chromium when available and otherwise skip. They simulate the shared media source; actual tab/system audio sharing still depends on the browser and OS. The additional `frontend/tests/audio-worklet.browser.mjs` check exercises real browser resampling and final-chunk flushing with generated audio; use `PLAYWRIGHT_MODULE` and `CHROMIUM_PATH` to select local browser tools.
 
 ## Roadmap
 

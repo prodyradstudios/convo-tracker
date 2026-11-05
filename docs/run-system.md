@@ -6,14 +6,14 @@ Install once, then start the server and open http://localhost:8000.
 
 ## Requirements
 
-You need Python 3.11 to 3.13 (3.12 recommended), git, a Chromium-based browser and a microphone. Newer or older Pythons may lack prebuilt packages, and the install then fails trying to compile them.
+You need Python 3.11 to 3.13 (3.12 recommended), git, a Chromium-based browser, and a microphone or a shareable computer-audio source. Newer or older Pythons may lack prebuilt packages, and the install then fails trying to compile them.
 
 | Item | Requirement | Check |
 | --- | --- | --- |
 | Python | 3.11, 3.12 or 3.13 | `python3 --version` |
 | OS | macOS (Apple Silicon or Intel), Linux, or Windows | none |
 | Browser | Chrome or Edge (Safari and Firefox untested) | none |
-| Microphone | Any; the browser asks for permission | none |
+| Audio input | Microphone, or browser-shared tab/system audio; support depends on browser and OS | Choose **Audio input** in the app |
 | Disk | About 3 GB for PyTorch and models | none |
 | Network | Internet on first start, to download the models from Hugging Face | none |
 
@@ -117,13 +117,28 @@ python -m app
 ```
 
 2. Wait for `Uvicorn running on http://127.0.0.1:8000`. The first start downloads the Whisper `base.en` and ECAPA models (a few hundred MB), so it can take a few minutes. Later starts take seconds.
-3. Open **http://localhost:8000** in Chrome and allow the microphone. Use `localhost` exactly: browsers block the mic on other plain-http addresses.
+3. Open **http://localhost:8000** in Chrome or Edge. Choose **Microphone** or **Computer audio** under **Audio input**; this applies to both enrollment and listening. Allow microphone access or choose an audio-capable share when prompted. Audio capture needs `localhost` or HTTPS.
 4. Check the footer. It should name `ecapa` (or `mfcc` for the basic speaker matcher) and `whisper`. If it says `null`, transcription was explicitly disabled; remove `CT_TRANSCRIBER=null` or set it to `whisper`, then restart. Model load failures now stop startup rather than silently substituting speech durations.
-5. **Enroll** each person in the People panel: type a name, press **Record**, talk normally for about 8 seconds, press **Stop**. Add 2 to 3 samples per person with **+ sample**: one normal, one louder or more animated, one quieter.
-6. **Listen**: press **Start listening** and talk. Each line appears with the speaker's name a second or two after they pause, and interruptions become separate lines.
+5. **Enroll** each person in the People panel: type a name, press **Record**, capture that person speaking alone for about 8 seconds, press **Stop**. Use the source where that person is heard; remote people should be enrolled from shared computer audio. Add 2 to 3 samples per person with **+ sample**: one normal, one louder or more animated, one quieter.
+6. **Listen**: press **Start listening** and begin the conversation. Computer-audio mode opens the sharing chooser again; reselect the desired source and enable audio. Each line appears with the speaker's name a second or two after they pause, and interruptions become separate lines.
 7. Press **Stop listening** when done. **Export** downloads the transcript as a `.txt` file.
 
 To stop the server, press **Ctrl+C** in the terminal. Enrolled voices are saved in `backend/data/speakers.json` and come back on the next start; **Remove all** in the People panel deletes them.
+
+## Capture Discord or other computer audio
+
+**Audio input** selects one source for both the People enrollment recorder and live listening. **Microphone** records your local microphone. **Computer audio** records only the audio supplied by the browser sharing chooser; it does not add your microphone.
+
+1. Open Discord in a browser tab when possible. Select **Computer audio** in Convo Tracker.
+2. Enroll each remote speaker separately: enter their name, press **Record**, choose the Discord tab in the sharing dialog, and enable **Share audio**. Have only that person speak for about 8 seconds, then stop. Repeat for the next person. Use the same audio source for enrollment and the conversation.
+3. Press **Start listening**, choose the Discord tab again, and enable **Share audio**. A fresh selection is required for every enrollment sample and every listening session; browser sharing permission is not saved by the app.
+4. Press **Stop listening** to finish, or stop sharing with the browser controls. Starting again opens a new chooser.
+
+For **native Discord** or other desktop apps, the browser may offer **Entire screen** with system audio. Use it only when the chooser offers an audio-sharing option for your browser and OS. Sharing a window or screen does not guarantee an audio track. If native-app/system audio is unavailable, run Discord in a browser tab and share that tab's audio. Browser and operating-system capture capabilities vary; no universal native-app support is assumed.
+
+The browser requires selecting a video surface (tab/window/screen) as part of its display-sharing permission, even though Convo Tracker processes and sends only audio. The local microphone is not mixed into Computer audio, so your own voice will not be transcribed unless the shared source already contains it. During enrollment, everyone except the named speaker must stay quiet.
+
+If the selected share has no audio track, the app shows an error rather than starting silent capture. Retry with an audio-capable tab or system-audio source and enable **Share audio**. Unsupported browsers show an explanatory error. Computer-audio capture uses the existing browser audio processing and backend API; no new Python packages, browser extension, Discord bot, or application dependency is needed.
 
 ## Configuration
 
@@ -167,6 +182,9 @@ Most problems come from the wrong Python version, the wrong folder, or an inacti
 | Footer says `null`, or lines show `[speech …s]` | `CT_TRANSCRIBER=null` explicitly disables transcription | Remove that setting or use `CT_TRANSCRIBER=whisper`, then restart |
 | Startup says Whisper cannot load | Missing runtime, blocked model download, or incompatible device | Install `backend/requirements.txt`, allow Hugging Face model downloads, use `CT_DEVICE=cpu`, or point `CT_WHISPER_MODEL` at a downloaded model directory |
 | Terminal warning mentioning `huggingface.co` | No internet on first start, or a proxy blocks it | Connect and restart; later starts work offline |
+| Computer audio unavailable | Browser or OS does not support the requested tab/system audio | Try current Chrome/Edge with Discord in a browser tab; choose the tab and enable **Share audio** |
+| Shared source has no audio | Audio was not enabled, or that window/screen cannot share audio | Choose an audio-capable tab or supported system-audio share and enable audio; recording will not start without an audio track |
+| Your own voice is missing from Computer audio | The shared source does not contain your microphone | Computer audio does not mix in the local microphone; choose Microphone when you want to record that source instead |
 | Mic blocked or no prompt | Page not opened on `localhost`, or permission denied earlier | Use http://localhost:8000; reset site permissions in the browser |
 | `Address already in use` | Another server is on port 8000 | Stop it, or start with `CT_PORT=8001 python -m app` |
 | Lines labeled Unknown | Voice far from the enrollment samples | Add samples with **+ sample**, or lower `CT_MATCH_THRESHOLD` |
