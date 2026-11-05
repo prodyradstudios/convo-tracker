@@ -228,6 +228,27 @@ def test_static_frontend_mounted_after_api(tmp_path, settings):
         assert c.get("/missing.js").status_code == 404
 
 
+def test_frontend_is_revalidated_so_updates_are_not_hidden_by_cache(tmp_path, settings):
+    # A cached old index.html/app.js hid the Audio input selector after an update.
+    front = tmp_path / "frontend"
+    (front / "js").mkdir(parents=True)
+    (front / "index.html").write_text("<h1>v1</h1>")
+    (front / "js" / "app.js").write_text("// v1")
+    app = create_app(settings, embedder=MfccEmbedder(), transcriber=FakeTranscriber(), frontend_dir=front)
+    with TestClient(app) as c:
+        for path in ("/", "/index.html", "/js/app.js"):
+            r = c.get(path)
+            assert r.status_code == 200
+            assert r.headers["cache-control"] == "no-cache"
+        # Unchanged files still revalidate cheaply.
+        etag = c.get("/js/app.js").headers["etag"]
+        assert c.get("/js/app.js", headers={"If-None-Match": etag}).status_code == 304
+        # An updated file is served fresh.
+        (front / "index.html").write_text("<h1>v2 with audio-source</h1>")
+        assert "audio-source" in c.get("/").text
+        assert "cache-control" not in c.get("/api/health").headers
+
+
 def test_missing_frontend_dir_does_not_crash(tmp_path, settings):
     app = create_app(settings, embedder=MfccEmbedder(), frontend_dir=tmp_path / "nope")
     with TestClient(app) as c:

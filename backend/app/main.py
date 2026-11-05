@@ -21,6 +21,20 @@ log = logging.getLogger(__name__)
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
 
+class FrontendFiles(StaticFiles):
+    """Static frontend that browsers must revalidate on every load.
+
+    Without a Cache-Control header browsers may reuse an old index.html or
+    app.js for hours after an update, hiding new features. ``no-cache`` still
+    allows caching, but the browser checks the ETag first (cheap 304s).
+    """
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -45,7 +59,7 @@ def create_app(
     app.include_router(speakers.router, prefix="/api")
     app.include_router(session.router)
     if frontend_dir is not None and Path(frontend_dir).is_dir():
-        app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+        app.mount("/", FrontendFiles(directory=frontend_dir, html=True), name="frontend")
     else:
         log.warning("frontend directory %s not found; serving API only", frontend_dir)
     return app
