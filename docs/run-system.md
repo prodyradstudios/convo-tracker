@@ -4,6 +4,56 @@
 
 Install once, then start the server and open http://localhost:8000.
 
+## Update an existing installation
+
+Restarting the server does not download changes from GitHub. If a new feature
+is missing, update your existing checkout before following **Run**. Do not clone
+another copy over your current installation.
+
+1. Stop the running server with **Ctrl+C**. Open a terminal in your existing
+   `convo-tracker` repository root (the folder containing `frontend` and `backend`).
+2. Check the checkout and update `main`:
+
+```bash
+git rev-parse --show-toplevel
+git status --short --branch
+git switch main
+git pull --ff-only origin main
+git log -1 --oneline
+git grep -n audio-source HEAD -- frontend/index.html
+```
+
+The last command should show the Audio input selector in the committed HTML.
+If switching or pulling fails because of local changes or diverging branches,
+keep those changes and inspect the error; do not reset or delete the checkout.
+The old `claude/keen-cannon-sxbxab` branch is no longer the installation target.
+
+3. Activate your existing `.venv` as described below and refresh dependencies:
+
+```bash
+python -m pip install -r backend/requirements.txt
+```
+
+If using ECAPA, refresh `backend/requirements-ml.txt` with the platform-specific
+command from **Install** instead. Your voice samples remain in `backend/data`.
+4. Follow **Run** from this same checkout, then hard-refresh the browser with
+   **Ctrl+Shift+R** (Windows/Linux) or **Cmd+Shift+R** (Mac).
+
+If Audio input is still missing, run this with the virtual environment active
+from the `backend` directory:
+
+```bash
+python -c "from app.main import FRONTEND_DIR; print(FRONTEND_DIR)"
+python -c "from urllib.request import urlopen; print('audio-source' in urlopen('http://127.0.0.1:8000/').read().decode())"
+```
+
+The first command identifies this checkout's frontend directory. The second
+checks the HTML actually served on port 8000: `False` means it is serving an
+older frontend, possibly from another checkout or an old server process. If it
+is `True`, check that the browser uses this same address and hard-refresh it.
+If the new server reports that port 8000 is already in use, it did not replace
+the old server; stop the old process in its terminal before restarting.
+
 ## Requirements
 
 You need Python 3.11 to 3.13 (3.12 recommended), git, a Chromium-based browser, and a microphone or a shareable computer-audio source. Newer or older Pythons may lack prebuilt packages, and the install then fails trying to compile them.
@@ -30,7 +80,7 @@ git clone https://github.com/prodyradstudios/convo-tracker.git
 cd convo-tracker
 ```
 
-2. Until PR #1 is merged, switch to the work branch: `git checkout claude/keen-cannon-sxbxab`. After the merge, stay on `main`.
+2. Use the current `main` branch: `git switch main`.
 3. Create and activate a virtual environment with Python 3.12:
 
 ```bash
@@ -49,7 +99,7 @@ On Windows, activate with `.venv\Scripts\activate` instead. Your prompt should n
 
 The extra index on Linux and Windows gets the smaller CPU-only PyTorch. For a smaller install with real transcription, install `backend/requirements.txt` instead; it uses Whisper for words and the basic MFCC speaker matcher. Speech-duration placeholders require explicitly setting `CT_TRANSCRIBER=null` and are intended only for interface development.
 
-To update later: `git pull`, then rerun step 4 if `backend/requirements*.txt` changed.
+To update later, follow **Update an existing installation** above.
 
 ## Windows (PowerShell)
 
@@ -106,7 +156,7 @@ Using Command Prompt instead of PowerShell: activate with `.venv\Scripts\activat
 
 ## Run
 
-Start the server from the `backend` folder with the virtual environment active, then use the app at http://localhost:8000.
+Start the server from the `backend` folder with the virtual environment active, then use the app at http://localhost:8000. To receive new features, complete **Update an existing installation** first; these startup commands do not update the code.
 
 1. Start the server:
 
@@ -175,6 +225,7 @@ Most problems come from the wrong Python version, the wrong folder, or an inacti
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| Audio input / Computer audio selector is missing | An older checkout or cached frontend is being served | Follow **Update an existing installation**, verify `git grep` and the served-HTML check, then hard-refresh the browser |
 | `pkg-config is required for building PyAV` | Python too new or too old for the prebuilt packages | Delete `.venv` and recreate it with `python3.12`, then reinstall |
 | `No module named 'uvicorn'` | The install failed or the venv isn't active | Activate the venv (`(.venv)` in the prompt) and rerun the install |
 | `Could not open requirements file: backend/requirements-ml.txt` | You are already inside `backend` | Drop the `backend/` prefix, or `cd ..` first |
